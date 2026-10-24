@@ -407,7 +407,8 @@ def current_sha(root: Path, rel: str) -> str | None:
     return sha256_text(full.read_bytes().decode("utf-8", errors="surrogateescape"))
 
 
-def _atomic_write(full: Path, text: str) -> None:
+def atomic_write(full: Path, text: str) -> None:
+    """Write via a temp file and rename, keeping the file's permissions."""
     full.parent.mkdir(parents=True, exist_ok=True)
     mode = full.stat().st_mode if full.exists() else None
     fd, tmp = tempfile.mkstemp(dir=str(full.parent), prefix=".locpilot-", suffix=".tmp")
@@ -448,7 +449,7 @@ def apply_changes(root: Path, changes: list[FileChange]) -> list[str]:
         if position < len(chain):
             pending.append((path, chain[-1].after))
     for path, text in pending:
-        _atomic_write(safe_join(root, path), text)
+        atomic_write(safe_join(root, path), text)
     return [path for path, _ in pending]
 
 
@@ -468,6 +469,6 @@ def revert_changes(root: Path, changes: list[FileChange]) -> tuple[list[str], li
         if chain[0].before is None:
             full.unlink()
         else:
-            _atomic_write(full, chain[0].before)
+            atomic_write(full, chain[0].before)
         restored.append(path)
     return restored, skipped

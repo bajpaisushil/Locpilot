@@ -1,15 +1,20 @@
-import { useQuery } from '@tanstack/react-query'
-import { ChevronRightIcon, FileIcon, FolderIcon, FolderOpenIcon, GitBranchIcon, HardDriveIcon } from 'lucide-react'
-import { useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ChevronRightIcon, FileIcon, FolderIcon, FolderOpenIcon, GitBranchIcon, HardDriveIcon, SaveIcon } from 'lucide-react'
+import { useEffect, useId, useState } from 'react'
+import { toast } from 'sonner'
 import { CodeViewer } from '@/components/code/LazyViewers'
 import { CopyButton } from '@/components/common/CopyButton'
 import { EmptyState, ErrorState, LoadingState } from '@/components/common/States'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Kbd } from '@/components/ui/kbd'
 import { ResizableGroup, ResizableHandle, ResizablePanel } from '@/components/ui/resizable'
+import { isMac, SAVE_EVENT } from '@/hooks/useShortcuts'
 import { api } from '@/lib/api'
-import { qk, useTask } from '@/lib/queries'
-import type { TreeEntry } from '@/lib/types'
+import { isActive, qk, useTask } from '@/lib/queries'
+import type { FileContent, TreeEntry } from '@/lib/types'
 import { cn } from '@/lib/utils'
+import { draftKey, useDrafts } from '@/store/drafts'
 import { useUi } from '@/store/ui'
 
 function ancestors(path: string): string[] {
@@ -38,6 +43,7 @@ function DirChildren({
   selectedPath: string | null
   onOpen: (p: string) => void
 }) {
+  const drafts = useDrafts((s) => s.drafts)
   const tree = useQuery({
     queryKey: qk.tree(repoId, path, taskId),
     queryFn: () => api.tree(repoId, path, taskId),
@@ -94,6 +100,9 @@ function DirChildren({
                 </>
               )}
               <span className="truncate">{e.name}</span>
+              {e.type === 'file' && drafts[draftKey(repoId, taskId, e.path)] && (
+                <span className="ml-auto text-warning" aria-label={`${e.name} has unsaved changes`}>●</span>
+              )}
             </button>
             {e.type === 'dir' && isOpen && (
               <DirChildren
@@ -114,15 +123,79 @@ function DirChildren({
   )
 }
 
-function FileView({ repoId, taskId }: { repoId: string; taskId: string | null }) {
+/** What the editor holds for the open file. */
+interface Loaded {
+  key: string
+  /** The saved version the editor's text is based on (sent as `expected_sha` on save). */
+  sha: string
+  content: string
+  /** Text the editor model starts with: the saved content, or a kept draft. */
+  initial: string
+  /** Counts (re)loads: each gets a fresh editor model; saving keeps the model (and the cursor). */
+  load: number
+}
+
+function FileView({ repoId, taskId, busy }: { repoId: string; taskId: string | null; busy: boolean }) {
   const target = useUi((s) => s.fileTarget)
   const path = target?.path ?? null
+  const qc = useQueryClient()
   const file = useQuery({
     queryKey: qk.file(repoId, path ?? '', taskId),
     queryFn: () => api.file(repoId, path as string, { taskId }),
     enabled: !!path,
     staleTime: 5_000,
+    refetchInterval: 5_000, // shows LocPilot's (and terminal) edits; unsaved edits are never replaced
   })
+  const data = file.data
+  const editable = !!data && !data.binary && !data.truncated
+  const key = draftKey(repoId, taskId, path ?? '')
+  const draft = useDrafts((s) => s.drafts[key])
+  const { keep, drop } = useDrafts.getState()
+  const [loaded, setLoaded] = useState<Loaded | null>(null)
+  // Editor models outlive this view; never let a later mount reuse one that holds old, unsaved text.
+  const instance = useId().replace(/[^a-zA-Z0-9]/g, '')
+
+  // (Re)load into the editor when another file opens (restoring its unsaved draft, if any), or when this one
+  // changed on disk and has no unsaved edits.
+  if (data && editable && (loaded?.key !== key || (!draft && data.sha !== loaded.sha))) {
+    const load = (loaded?.load ?? 0) + 1
+    setLoaded(draft ? { key, sha: draft.sha, content: draft.base, initial: draft.text, load }
+                    : { key, sha: data.sha, content: data.content, initial: data.content, load })
+  }
+  const dirty = !!draft && loaded?.key === key
+  const changedOnDisk = dirty && !!data && !!loaded && data.sha !== loaded.sha
+
+  const save = useMutation({
+    mutationFn: (v: { current: Loaded; content: string }) =>
+      api.saveFile(repoId, { path: path as string, content: v.content, expected_sha: v.current.sha, task_id: taskId }),
+    onSuccess: (res, v) => {
+      setLoaded((l) => (l && l.key === v.current.key ? { ...l, sha: res.sha, content: v.content } : l))
+      const now = useDrafts.getState().drafts[v.current.key]
+      if (!now || now.text === v.content) drop(v.current.key)
+      else keep(v.current.key, { sha: res.sha, base: v.content, text: now.text }) // typed while saving
+      qc.setQueryData<FileContent>(qk.file(repoId, path as string, taskId), (old) =>
+        old ? { ...old, content: v.content, sha: res.sha, total_lines: v.content.split('\n').length } : old,
+      )
+      if (taskId) {
+        void qc.invalidateQueries({ queryKey: qk.worktreeChanges(taskId) })
+        void qc.invalidateQueries({ queryKey: qk.diff(taskId) })
+      } else {
+        void qc.invalidateQueries({ queryKey: qk.repo(repoId) })
+      }
+      toast.success(`Saved ${res.path}`)
+    },
+  })
+  const { mutate: saveMutate, isPending: saving } = save
+
+  useEffect(() => {
+    if (!editable || !loaded || !draft) return
+    const onSave = () => {
+      if (!saving && !busy) saveMutate({ current: loaded, content: draft.text })
+    }
+    window.addEventListener(SAVE_EVENT, onSave)
+    return () => window.removeEventListener(SAVE_EVENT, onSave)
+  }, [editable, loaded, draft, saving, busy, saveMutate])
+
   if (!path)
     return (
       <EmptyState
@@ -132,10 +205,18 @@ function FileView({ repoId, taskId }: { repoId: string; taskId: string | null })
         className="h-full"
       />
     )
+  const reload = () => {
+    if (!data) return
+    drop(key)
+    setLoaded({ key, sha: data.sha, content: data.content, initial: data.content, load: (loaded?.load ?? 0) + 1 })
+    save.reset()
+  }
+  const showEditor = editable && loaded?.key === key
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex h-8 shrink-0 items-center gap-2 border-b px-3">
         <span className="min-w-0 flex-1 truncate font-mono text-[11.5px]" title={path}>
+          {dirty && <span className="mr-1 text-warning" aria-label="Unsaved changes">●</span>}
           {path}
           {target?.start ? <span className="text-primary">:{target.start}{target.end && target.end !== target.start ? `-${target.end}` : ''}</span> : null}
         </span>
@@ -144,11 +225,37 @@ function FileView({ repoId, taskId }: { repoId: string; taskId: string | null })
             {file.data.total_lines} lines · {file.data.language}
           </span>
         )}
+        {editable && (
+          <Button
+            size="xs"
+            variant={dirty ? 'default' : 'ghost'}
+            disabled={!dirty || saving || busy}
+            onClick={() => loaded && draft && save.mutate({ current: loaded, content: draft.text })}
+            aria-label="Save file"
+            title={busy ? 'LocPilot is editing this worktree; save when it finishes' : undefined}
+          >
+            <SaveIcon />
+            Save <Kbd>{isMac() ? '⌘S' : 'Ctrl+S'}</Kbd>
+          </Button>
+        )}
         <CopyButton text={path} label="Copy path" />
       </div>
       {file.data?.truncated && (
         <div className="border-b bg-warning/8 px-3 py-1 text-[11px] text-warning">
-          Large file — showing lines {file.data.start_line}–{file.data.end_line} of {file.data.total_lines}.
+          Large file — showing lines {file.data.start_line}–{file.data.end_line} of {file.data.total_lines} (read-only).
+        </div>
+      )}
+      {changedOnDisk && (
+        <div className="flex items-center gap-2 border-b bg-warning/8 px-3 py-1 text-[11px] text-warning">
+          <span className="flex-1">This file changed on disk while you were editing it.</span>
+          <Button size="xs" variant="outline" onClick={reload}>
+            Reload — discard my edits
+          </Button>
+        </div>
+      )}
+      {save.isError && (
+        <div className="border-b p-2">
+          <ErrorState error={save.error} title="Not saved" compact />
         </div>
       )}
       <div className="min-h-0 flex-1">
@@ -160,6 +267,20 @@ function FileView({ repoId, taskId }: { repoId: string; taskId: string | null })
           </div>
         ) : file.data?.binary ? (
           <EmptyState icon={<FileIcon />} title="Binary file" description="Binary files are not displayed." className="h-full" />
+        ) : showEditor && loaded ? (
+          <CodeViewer
+            modelPath={`${repoId}/${taskId ?? 'workdir'}/edit-${instance}-${loaded.load}/${path}`}
+            path={path}
+            content={loaded.initial}
+            language={file.data?.language}
+            highlight={target?.start ? { start: target.start, end: target.end } : null}
+            revealNonce={target?.nonce}
+            editable
+            onChange={(value) => {
+              if (value === loaded.content) drop(key)
+              else keep(key, { sha: loaded.sha, base: loaded.content, text: value })
+            }}
+          />
         ) : file.data ? (
           <CodeViewer
             modelPath={`${repoId}/${taskId ?? 'workdir'}/${file.data.sha}/${path}`}
@@ -254,7 +375,7 @@ export function FilesTab() {
         </ResizablePanel>
         <ResizableHandle orientation="vertical" />
         <ResizablePanel id="viewer" minSize={120}>
-          <FileView repoId={repoId} taskId={viewTaskId} />
+          <FileView repoId={repoId} taskId={viewTaskId} busy={!!viewTaskId && isActive(task.data?.status)} />
         </ResizablePanel>
       </ResizableGroup>
     </div>

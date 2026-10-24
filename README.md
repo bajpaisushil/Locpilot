@@ -19,7 +19,7 @@ cloud model fallback.
 * **Connect a repository** — clone a public GitHub/GitLab/Bitbucket URL into LocPilot's
   workspace, or pick an existing local checkout (native folder picker in the desktop app).
   Shows branch, HEAD, and working-tree status; never modifies your checkout unless you click
-  **Apply to my repo**.
+  **Apply to my repo** or save a file you edited there.
 * **Ask mode (read-only)** — explanations and root-cause analyses grounded in retrieved
   code: execution flow, files/functions/lines examined, hypotheses with confidence and
   supporting/contradicting evidence, most likely root cause (or an explicit "evidence is
@@ -39,6 +39,10 @@ cloud model fallback.
 * **Terminal** — a real shell like VS Code's (xterm.js) in the task worktree or your repository
   folder: start your dev server there and LocPilot's next edits reload live; `localhost`
   links open in your browser; **Send to LocPilot** puts terminal output into your message.
+  **⌘J** (Ctrl+J) shows or hides it.
+* **Edit and save** — files open in an editor (Monaco, as in VS Code); **⌘S** (Ctrl+S) saves to
+  the side you are viewing (your working tree or the task worktree). A save never overwrites a
+  change made meanwhile by LocPilot or anything else — you get a reload prompt instead.
 * **Source control** — VS Code-style: type a commit message, tick files, **Commit** or
   **Commit & Push** to a `locpilot/…` branch (your checked-out branch is never moved; push uses
   your own Git credentials and then links to the pull-request page), or **Apply to my repo**

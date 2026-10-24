@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRightIcon, PlayIcon, ShieldIcon, SquareIcon, TerminalIcon, WrenchIcon } from 'lucide-react'
 import { useState, type KeyboardEvent } from 'react'
+import { toast } from 'sonner'
 import { CommandStatusBadge, OutputBlock } from '@/components/chat/CommandCard'
 import { EmptyState, ErrorState, LoadingState } from '@/components/common/States'
 import { Badge } from '@/components/ui/badge'
@@ -124,7 +125,13 @@ function RunBar({ task, onStarted }: { task: TaskDetail; onStarted: (commandId: 
 
   const submit = async () => {
     const command = draft.trim()
-    if (!command || blocked || running || run.isPending) return
+    if (running && command) {
+      toast.info('A command is still running', {
+        description: 'Stop it first, or use the Terminal tab to run things side by side.',
+      })
+      return
+    }
+    if (!command || blocked || run.isPending) return
     try {
       const started = await run.mutateAsync({ taskId: task.id, command, allowNetwork })
       setDraft('')
@@ -136,6 +143,11 @@ function RunBar({ task, onStarted }: { task: TaskDetail; onStarted: (commandId: 
   }
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+      e.preventDefault() // explicit: works whether the Run or the Stop button is showing
+      void submit()
+      return
+    }
     if ((e.key !== 'ArrowUp' && e.key !== 'ArrowDown') || !history.length) return
     e.preventDefault()
     const next = e.key === 'ArrowUp' ? Math.min(recall + 1, history.length - 1) : Math.max(recall - 1, -1)

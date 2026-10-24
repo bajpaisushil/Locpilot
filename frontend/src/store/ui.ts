@@ -25,6 +25,8 @@ interface UiState {
   rightPanelOpen: boolean
   rightTab: RightTab
   fileTarget: FileTarget | null
+  /** The terminal shown in the Terminal tab (kept while you switch tabs; ids live as long as the backend). */
+  activeTerminalId: string | null
   theme: Theme
   setupOpen: boolean
   setupDismissed: boolean
@@ -39,6 +41,7 @@ interface UiState {
   setRightPanelOpen: (open: boolean) => void
   setRightTab: (tab: RightTab) => void
   openFile: (target: Omit<FileTarget, 'nonce'>) => void
+  setActiveTerminalId: (id: string | null) => void
   setTheme: (theme: Theme) => void
   setSetupOpen: (open: boolean) => void
   setSetupDismissed: (dismissed: boolean) => void
@@ -59,6 +62,7 @@ export const useUi = create<UiState>()(
       rightPanelOpen: true,
       rightTab: 'files',
       fileTarget: null,
+      activeTerminalId: null,
       theme: 'dark',
       setupOpen: false,
       setupDismissed: false,
@@ -75,6 +79,7 @@ export const useUi = create<UiState>()(
       setRightTab: (rightTab) => set({ rightTab, rightPanelOpen: true }),
       openFile: (target) =>
         set({ fileTarget: { ...target, nonce: ++nonce }, rightPanelOpen: true, rightTab: 'files' }),
+      setActiveTerminalId: (activeTerminalId) => set({ activeTerminalId }),
       setTheme: (theme) => set({ theme }),
       setSetupOpen: (setupOpen) => set({ setupOpen }),
       setSetupDismissed: (setupDismissed) => set({ setupDismissed }),

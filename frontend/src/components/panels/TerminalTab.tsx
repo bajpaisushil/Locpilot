@@ -1,10 +1,11 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ChevronDownIcon, FolderGitIcon, PlusIcon, SquareTerminalIcon, WrenchIcon, XIcon } from 'lucide-react'
-import { useState } from 'react'
 import { EmptyState, ErrorState, LoadingState } from '@/components/common/States'
 import { XtermView } from '@/components/terminal/LazyXtermView'
 import { Button } from '@/components/ui/button'
+import { Kbd } from '@/components/ui/kbd'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { isMac } from '@/hooks/useShortcuts'
 import { api } from '@/lib/api'
 import { qk, useTask, useTerminals } from '@/lib/queries'
 import type { TerminalOut } from '@/lib/types'
@@ -19,7 +20,8 @@ export function TerminalTab() {
   const task = useTask(taskId)
   const terminals = useTerminals(repoId)
   const qc = useQueryClient()
-  const [activeId, setActiveId] = useState<string | null>(null)
+  const activeId = useUi((s) => s.activeTerminalId)
+  const setActiveId = useUi((s) => s.setActiveTerminalId)
   const worktreeTaskId = task.data?.worktree_path ? task.data.id : null
 
   const setList = (update: (old: TerminalOut[]) => TerminalOut[]) =>
@@ -137,6 +139,9 @@ export function TerminalTab() {
                 </Button>
               ))}
             </div>
+            <p className="text-[11px] text-muted-foreground">
+              <Kbd>{isMac() ? '⌘J' : 'Ctrl+J'}</Kbd> shows or hides the terminal
+            </p>
           </EmptyState>
         )}
       </div>

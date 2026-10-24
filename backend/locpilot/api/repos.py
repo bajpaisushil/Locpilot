@@ -8,12 +8,13 @@ from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
 
-from locpilot.api.models import ApiError, RepoCreate, db_of, settings_of
+from locpilot.api.models import ApiError, FileWrite, RepoCreate, db_of, manager_of, settings_of
 from locpilot.repos import RepoValidationError, register_local, register_remote
 from locpilot.security.paths import PathSecurityError, is_within, safe_join
 from locpilot.tools import git
 from locpilot.tools.files import MAX_VIEW_BYTES, drop_index, get_index, monaco_language, sha256_text
 from locpilot.tools.manifests import inspect_project
+from locpilot.tools.patch import atomic_write
 from locpilot.tools.search import SearchError, search
 
 router = APIRouter(prefix="/api/repos")
@@ -136,6 +137,39 @@ async def read_file(repo_id: str, request: Request, path: str, start: int | None
     content = "\n".join(lines[s - 1:e]) if (start or end) else text
     return {"path": rel, "content": content, "start_line": s if lines else 0, "end_line": e, "total_lines": len(lines),
             "language": monaco_language(rel), "truncated": truncated, "binary": False, "sha": sha256_text(text)}
+
+
+@router.put("/{repo_id}/file")
+async def write_file(repo_id: str, body: FileWrite, request: Request) -> dict:
+    """Save an edit made in the file editor (⌘S), in the repository folder or a task's worktree.
+
+    Refuses unless the file still has the content the editor loaded (``expected_sha``), so a save never
+    silently overwrites a change made meanwhile (by LocPilot, a terminal or another editor).
+    """
+    repo = _repo_or_404(request, repo_id)
+    root = _root_for(request, repo, body.task_id)
+    if body.task_id and root != Path(repo["path"]) and manager_of(request).is_running(body.task_id):
+        raise ApiError(409, "task_busy", "LocPilot is editing this worktree right now. Save again when it finishes.")
+    try:
+        full = safe_join(root, body.path)
+    except PathSecurityError as exc:
+        raise ApiError(403, "path_forbidden", str(exc)) from None
+    if not full.is_file():
+        raise ApiError(404, "file_not_found", f"{body.path} does not exist.")
+    raw = await asyncio.to_thread(full.read_bytes)
+    if b"\x00" in raw[:8192] or len(raw) > MAX_VIEW_BYTES:
+        raise ApiError(400, "not_editable", "Binary and very large files can't be edited here.")
+    try:
+        current = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ApiError(400, "not_editable", "Only UTF-8 text files can be edited here.") from None
+    rel = full.relative_to(root.resolve()).as_posix()
+    if sha256_text(current) != body.expected_sha:
+        raise ApiError(409, "file_changed", f"{rel} changed on disk since you opened it.",
+                       "Reload the file to see the latest version, then redo your edit.")
+    await asyncio.to_thread(atomic_write, full, body.content)
+    get_index(root).invalidate(rel)
+    return {"path": rel, "sha": sha256_text(body.content), "size": len(body.content.encode("utf-8"))}
 
 
 @router.get("/{repo_id}/search")

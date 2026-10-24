@@ -165,6 +165,9 @@ export const api = {
       'GET',
       `/api/repos/${enc(id)}/file${q({ path, start: opts.start, end: opts.end, task_id: opts.taskId })}`,
     ),
+  /** Saves an edited file (refused with 409 `file_changed` if it changed on disk since it was loaded). */
+  saveFile: (id: string, body: { path: string; content: string; expected_sha: string; task_id: string | null }) =>
+    request<{ path: string; sha: string; size: number }>('PUT', `/api/repos/${enc(id)}/file`, body),
   search: (id: string, query: string, regex = false) =>
     request<SearchHit[]>('GET', `/api/repos/${enc(id)}/search${q({ q: query, regex })}`),
 

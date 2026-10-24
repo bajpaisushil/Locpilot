@@ -63,6 +63,13 @@ class UserCommandCreate(BaseModel):
         return value
 
 
+class FileWrite(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    content: str = Field(max_length=2_000_000)
+    expected_sha: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_id: str | None = Field(None, max_length=64)
+
+
 class FileSelection(BaseModel):
     files: list[str] = Field(min_length=1, max_length=500)
 

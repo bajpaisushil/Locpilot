@@ -1,6 +1,7 @@
 import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { toast } from 'sonner'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { CommandsTab } from '@/components/panels/CommandsTab'
 import { useUi } from '@/store/ui'
 import { json, mockFetch, renderWithProviders } from './utils'
@@ -55,6 +56,17 @@ describe('CommandsTab run bar', () => {
     renderWithProviders(<CommandsTab />)
     await user.click(await screen.findByRole('button', { name: /stop command/i }))
     await waitFor(() => expect(calls.some((c) => c.method === 'POST' && c.path.endsWith('/c_5/stop'))).toBe(true))
+  })
+
+  it('says so instead of silently ignoring Enter while a command runs', async () => {
+    const user = userEvent.setup()
+    const info = vi.spyOn(toast, 'info')
+    const running = userCommand({ id: 'c_5', status: 'running', exit_code: null, finished_at: null })
+    const { calls } = mockFetch({ 'GET /api/tasks/t_1': codeTask({ commands: [running] }) })
+    renderWithProviders(<CommandsTab />)
+    await user.type(await screen.findByRole('textbox', { name: /command to run/i }), 'npm test{Enter}')
+    expect(info).toHaveBeenCalledWith('A command is still running', expect.anything())
+    expect(calls.some((c) => c.method === 'POST')).toBe(false)
   })
 
   it('recalls earlier commands with the arrow keys', async () => {

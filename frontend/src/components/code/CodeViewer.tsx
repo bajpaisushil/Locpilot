@@ -18,6 +18,8 @@ export function CodeViewer({
   language,
   highlight,
   revealNonce,
+  editable = false,
+  onChange,
 }: {
   /** Unique model id (e.g. includes repo/worktree) so different versions of a file don't collide. */
   modelPath: string
@@ -26,6 +28,9 @@ export function CodeViewer({
   language?: string | null
   highlight?: LineRange | null
   revealNonce?: number
+  /** Writable and uncontrolled: edits live in the editor until the caller saves them. */
+  editable?: boolean
+  onChange?: (value: string) => void
 }) {
   const theme = useUi((s) => s.theme)
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
@@ -61,7 +66,8 @@ export function CodeViewer({
   return (
     <Editor
       path={modelPath}
-      value={content}
+      {...(editable ? { defaultValue: content } : { value: content })}
+      onChange={editable ? (value) => onChange?.(value ?? '') : undefined}
       language={monacoLanguage(path, language)}
       theme={monacoTheme(theme)}
       loading={<LoadingState label="Loading editor…" />}
@@ -71,8 +77,8 @@ export function CodeViewer({
         applyHighlight()
       }}
       options={{
-        readOnly: true,
-        domReadOnly: true,
+        readOnly: !editable,
+        domReadOnly: !editable,
         minimap: { enabled: false },
         fontFamily: EDITOR_FONT,
         fontSize: 12.5,

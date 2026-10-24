@@ -6,6 +6,7 @@ import { RightPanel } from '@/components/panels/RightPanel'
 import { AddRepoDialog } from '@/components/repos/AddRepoDialog'
 import { SettingsDialog } from '@/components/settings/SettingsDialog'
 import { ResizableGroup, ResizableHandle, ResizablePanel } from '@/components/ui/resizable'
+import { useShortcuts } from '@/hooks/useShortcuts'
 import { useTaskStream } from '@/hooks/useTaskStream'
 import { useRepos } from '@/lib/queries'
 import { useUi } from '@/store/ui'
@@ -18,6 +19,7 @@ export function AppShell() {
   const repos = useRepos()
 
   useTaskStream(taskId)
+  useShortcuts()
 
   // Keep the selection valid: fall back to the most recently opened repository.
   useEffect(() => {

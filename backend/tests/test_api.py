@@ -420,6 +420,57 @@ async def test_publishing_needs_a_worktree_and_a_commit(api, tmp_path):
     assert r.status_code == 400
 
 
+async def test_saving_edits_from_the_editor(api, tmp_path):
+    fake = FakeLLM(hotel_script())
+    app, client = await api(fake)
+    repo = make_repo(tmp_path / "hotel", "hotel-offers")
+    (repo / "blob.bin").write_bytes(b"\x00\x01binary")
+    rid = (await client.post("/api/repos", json={"source": "local", "path": str(repo)}, headers=H)).json()["id"]
+    url = f"/api/repos/{rid}/file"
+
+    # Your working tree: saved in place; a stale save is refused and writes nothing.
+    loaded = (await client.get(url, params={"path": "README.md"})).json()
+    edited = loaded["content"] + "\nEdited in LocPilot.\n"
+    r = await client.put(url, json={"path": "README.md", "content": edited, "expected_sha": loaded["sha"]}, headers=H)
+    assert r.status_code == 200, r.text
+    assert (repo / "README.md").read_text() == edited
+    assert (await client.get(url, params={"path": "README.md"})).json()["sha"] == r.json()["sha"]
+    r = await client.put(url, json={"path": "README.md", "content": "clobber", "expected_sha": loaded["sha"]}, headers=H)
+    assert r.status_code == 409 and r.json()["error"] == "file_changed" and r.json()["hint"]
+    assert (repo / "README.md").read_text() == edited
+
+    any_sha = "0" * 64
+    for path, status in [("../outside.txt", 403), (".git/config", 403), (".env", 403), ("nope.py", 404),
+                         ("blob.bin", 400)]:
+        r = await client.put(url, json={"path": path, "content": "x", "expected_sha": any_sha}, headers=H)
+        assert r.status_code == status, (path, r.text)
+    assert (await client.put(url, json={"path": "README.md", "content": "x", "expected_sha": "abc"},
+                             headers=H)).status_code == 422
+    assert (await client.put(url, json={"path": "README.md", "content": "x", "expected_sha": any_sha})).status_code == 403
+
+    # A task worktree: refused while LocPilot works in it, saved there (not in your checkout) afterwards.
+    fake.gate, fake.block_step = asyncio.Event(), "understand"
+    task_id = (await client.post("/api/tasks", json={"repo_id": rid, "mode": "code", "message": "Fix duplicates"},
+                                 headers=H)).json()["id"]
+    for _ in range(200):
+        worktree = app.state.db.get_task(task_id)["worktree_path"]
+        if worktree:
+            break
+        await asyncio.sleep(0.05)
+    params = {"path": "offers/models.py", "task_id": task_id}
+    loaded = (await client.get(url, params=params)).json()
+    body = {"path": "offers/models.py", "content": loaded["content"] + "# tweak\n", "expected_sha": loaded["sha"],
+            "task_id": task_id}
+    r = await client.put(url, json=body, headers=H)
+    assert r.status_code == 409 and r.json()["error"] == "task_busy"
+    fake.gate.set()
+    await _wait_until_false(app.state.manager.is_running, task_id)
+    r = await client.put(url, json=body, headers=H)
+    assert r.status_code == 200, r.text
+    assert (Path(worktree) / "offers/models.py").read_text().endswith("# tweak\n")
+    assert not (repo / "offers/models.py").read_text().endswith("# tweak\n")
+
+
 def test_branch_names_keep_whole_words():
     from locpilot.api.tasks import _branch_slug
 

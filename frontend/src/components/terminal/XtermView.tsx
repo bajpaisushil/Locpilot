@@ -2,12 +2,14 @@ import '@xterm/xterm/css/xterm.css'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { Terminal } from '@xterm/xterm'
+import { useQueryClient } from '@tanstack/react-query'
 import { MessageSquarePlusIcon } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
 import { api, errorMessage } from '@/lib/api'
 import { openExternal } from '@/lib/desktop'
+import { qk } from '@/lib/queries'
 import { createInputSender, streamTerminal, tailText, TERMINAL_FONT, TERMINAL_THEMES } from '@/lib/terminal'
 import type { TerminalOut } from '@/lib/types'
 import { useUi } from '@/store/ui'
@@ -15,6 +17,7 @@ import { useUi } from '@/store/ui'
 /** One live terminal: renders the shell's output and sends keystrokes, resizes and pastes back. */
 export function XtermView({ terminal }: { terminal: TerminalOut }) {
   const theme = useUi((s) => s.theme)
+  const qc = useQueryClient()
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const [exited, setExited] = useState<{ code: number | null } | null>(
@@ -43,7 +46,12 @@ export function XtermView({ terminal }: { terminal: TerminalOut }) {
       (data) => api.terminalInput(terminal.id, data),
       (err) => setError(errorMessage(err)),
     )
-    const input = term.onData(send)
+    // Redrawing history makes xterm answer the old queries in it (cursor position, colours…) again;
+    // those answers are not typing and must never reach the shell.
+    let replaying = false
+    const input = term.onData((data) => {
+      if (!replaying) send(data)
+    })
 
     let lastSize = ''
     let frame = 0
@@ -68,12 +76,17 @@ export function XtermView({ terminal }: { terminal: TerminalOut }) {
     const stream = streamTerminal(terminal.id, {
       onReset: (scrollback) => {
         term.reset()
-        if (scrollback) term.write(scrollback)
+        if (!scrollback) return
+        replaying = true
+        term.write(scrollback, () => {
+          replaying = false
+        })
       },
       onOutput: (data) => term.write(data),
       onExit: (code) => {
         setExited({ code })
         term.write(`\r\n\x1b[2m[process exited with code ${code ?? '?'}]\x1b[0m\r\n`)
+        void qc.invalidateQueries({ queryKey: qk.terminals(terminal.repo_id) }) // the tab shows "(exited)" now
       },
       onClosed: () => setExited((prev) => prev ?? { code: null }),
     })
@@ -86,7 +99,7 @@ export function XtermView({ terminal }: { terminal: TerminalOut }) {
       term.dispose()
       termRef.current = null
     }
-  }, [terminal.id])
+  }, [terminal.id, terminal.repo_id, qc])
 
   useEffect(() => {
     if (termRef.current) termRef.current.options.theme = TERMINAL_THEMES[theme]

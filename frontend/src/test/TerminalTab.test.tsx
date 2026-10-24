@@ -17,7 +17,7 @@ const term = (overrides: Partial<TerminalOut> = {}): TerminalOut => ({
 })
 
 describe('TerminalTab', () => {
-  beforeEach(() => useUi.setState({ selectedRepoId: 'r_1', selectedTaskId: 't_1' }))
+  beforeEach(() => useUi.setState({ selectedRepoId: 'r_1', selectedTaskId: 't_1', activeTerminalId: null }))
 
   it('opens a shell in the task worktree, and closes it', async () => {
     const user = userEvent.setup()
@@ -41,6 +41,21 @@ describe('TerminalTab', () => {
     await user.click(screen.getByRole('button', { name: /close terminal/i }))
     await waitFor(() => expect(screen.queryByTestId('xterm')).not.toBeInTheDocument())
     expect(calls.some((c) => c.method === 'DELETE')).toBe(true)
+  })
+
+  it('comes back to the terminal you were using after switching panels', async () => {
+    const user = userEvent.setup()
+    mockFetch({
+      'GET /api/tasks/t_1': taskDetail({ mode: 'code', worktree_path: '/data/worktrees/t_1' }),
+      'GET /api/terminals': [term(), term({ id: 'term_2', title: 'hotel', location: 'repository', cwd: '/home/me/hotel', task_id: null })],
+    })
+    const first = renderWithProviders(<TerminalTab />)
+    expect(await screen.findByTestId('xterm')).toHaveTextContent('worktree:/data/worktrees/t_1')
+    await user.click(screen.getByRole('tab', { name: /^hotel$/ }))
+    expect(screen.getByTestId('xterm')).toHaveTextContent('repository:/home/me/hotel')
+    first.unmount()
+    renderWithProviders(<TerminalTab />)
+    expect(await screen.findByTestId('xterm')).toHaveTextContent('repository:/home/me/hotel')
   })
 
   it('offers only the repository folder when the task has no worktree', async () => {

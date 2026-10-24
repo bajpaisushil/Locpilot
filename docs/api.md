@@ -107,6 +107,7 @@ interface ModelStatus { ollama_reachable: boolean; ollama_version: string | null
 | DELETE | `/api/repos/{repo_id}?delete_clone=false` | Unregisters. Only LocPilot-managed clones can be deleted from disk. → `{ "ok": true }` |
 | GET | `/api/repos/{repo_id}/tree?path=&task_id=` | `TreeEntry[]` children of a directory (respects .gitignore + exclusions). With `task_id`, lists that task's worktree (includes files LocPilot created). |
 | GET | `/api/repos/{repo_id}/file?path=&start=&end=&task_id=` | `FileContent`. With `task_id`, reads from that task's worktree. |
+| PUT | `/api/repos/{repo_id}/file` | body `{ path, content, expected_sha, task_id? }` saves an edit (UTF-8 text, ≤ 2 MB) to the working tree or the task's worktree → `{ path, sha, size }`. 409 `file_changed` if the file no longer has `expected_sha` (the `sha` from the read), 409 `task_busy` while LocPilot works in that worktree, 400 `not_editable` for binary/large/non-UTF-8 files. |
 | GET | `/api/repos/{repo_id}/search?q=&regex=false&task_id=` | `SearchHit[]` (max 200); `task_id` searches the task's worktree |
 
 ```ts

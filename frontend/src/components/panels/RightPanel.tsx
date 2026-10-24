@@ -4,6 +4,7 @@ import { CommandsTab } from '@/components/panels/CommandsTab'
 import { DetailsTab } from '@/components/panels/DetailsTab'
 import { FilesTab } from '@/components/panels/FilesTab'
 import { TerminalTab } from '@/components/panels/TerminalTab'
+import { isMac } from '@/hooks/useShortcuts'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTask } from '@/lib/queries'
 import { useUi, type RightTab } from '@/store/ui'
@@ -34,7 +35,7 @@ export function RightPanel() {
             Commands
             {commandCount > 0 && <span className="rounded bg-muted-foreground/20 px-1 text-[10px]">{commandCount}</span>}
           </TabsTrigger>
-          <TabsTrigger value="terminal">
+          <TabsTrigger value="terminal" title={`Terminal (${isMac() ? '⌘J' : 'Ctrl+J'})`}>
             <SquareTerminalIcon />
             Terminal
           </TabsTrigger>

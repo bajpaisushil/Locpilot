@@ -26,8 +26,11 @@ vi.mock('@xterm/xterm', () => ({
       fake.resets++
       fake.writes = []
     }
-    write(data: string) {
+    write(data: string, done?: () => void) {
       fake.writes.push(data)
+      // Like xterm: answer a cursor-position query found in the data, then report the write as processed.
+      if (data.includes('\x1b[6n')) fake.onData?.('\x1b[5;1R')
+      done?.()
     }
     onData(cb: (data: string) => void) {
       fake.onData = cb
@@ -54,6 +57,21 @@ const sse = (frames: [string, object][]) =>
   })
 
 describe('XtermView', () => {
+  it('never sends the answers to old queries replayed from history as typing', async () => {
+    const { calls } = mockFetch({
+      'GET /api/terminals/term_1/stream': () =>
+        sse([['reset', { data: '>>> \x1b[6n' }], ['output', { type: 'output', data: 'live \x1b[6n' }],
+             ['exit', { type: 'exit', code: 0 }]]),
+      'POST /api/terminals/term_1/input': () => new Response(null, { status: 204 }),
+      'POST /api/terminals/term_1/resize': () => new Response(null, { status: 204 }),
+    })
+    renderWithProviders(<XtermView terminal={terminal} />)
+    await waitFor(() => expect(fake.writes.join('')).toContain('[process exited with code 0]'))
+    await waitFor(() => expect(calls.filter((c) => c.path.endsWith('/input'))).toHaveLength(1))
+    // Only the live query was answered to the shell; the replayed one was not.
+    expect(calls.filter((c) => c.path.endsWith('/input')).map((c) => (c.body as { data: string }).data)).toEqual(['\x1b[5;1R'])
+  })
+
   beforeEach(() => {
     fake.writes = []
     fake.onData = null
@@ -69,8 +87,10 @@ describe('XtermView', () => {
              ['exit', { type: 'exit', code: 0 }]]),
       'POST /api/terminals/term_1/resize': () => new Response(null, { status: 204 }),
     })
-    renderWithProviders(<XtermView terminal={terminal} />)
+    const { queryClient } = renderWithProviders(<XtermView terminal={terminal} />)
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
     await waitFor(() => expect(fake.writes.join('')).toContain('[process exited with code 0]'))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['terminals', 'r_1'] }) // tab label shows "(exited)"
     expect(fake.resets).toBe(1)
     expect(fake.writes.join('')).toContain('$ npm run dev\r\nLocal: http://localhost:5173/')
     expect(await screen.findByText(/exited \(0\)/)).toBeInTheDocument()
