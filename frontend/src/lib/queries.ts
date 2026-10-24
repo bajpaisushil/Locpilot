@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from './api'
-import type { Mode, RepoCreate, RepoDetail, RepoSummary, TaskDetail, TaskStatus } from './types'
+import type { CommandOut, Mode, RepoCreate, RepoDetail, RepoSummary, TaskDetail, TaskStatus } from './types'
 
 export const qk = {
   setup: ['setup'] as const,
@@ -14,6 +14,8 @@ export const qk = {
   task: (id: string) => ['task', id] as const,
   diff: (id: string) => ['task', id, 'diff'] as const,
   command: (taskId: string, commandId: string) => ['task', taskId, 'command', commandId] as const,
+  worktreeChanges: (id: string) => ['task', id, 'worktree-changes'] as const,
+  terminals: (repoId: string) => ['terminals', repoId] as const,
 }
 
 export const ACTIVE_STATUSES: TaskStatus[] = ['queued', 'running']
@@ -117,6 +119,85 @@ export function useSendMessage() {
   return useMutation({
     mutationFn: (v: { taskId: string; message: string; mode?: Mode }) => api.sendMessage(v.taskId, v.message, v.mode),
     onSuccess: (task) => storeTask(qc, task),
+  })
+}
+
+/** Uncommitted changes in a task worktree; polled, since terminal edits emit no events. */
+export function useWorktreeChanges(id: string | null, enabled = true) {
+  return useQuery({
+    queryKey: qk.worktreeChanges(id ?? ''),
+    queryFn: () => api.worktreeChanges(id as string),
+    enabled: !!id && enabled,
+    refetchInterval: 10_000,
+  })
+}
+
+function invalidateChanges(qc: ReturnType<typeof useQueryClient>, taskId: string) {
+  void qc.invalidateQueries({ queryKey: qk.worktreeChanges(taskId) })
+  void qc.invalidateQueries({ queryKey: qk.diff(taskId) })
+  void qc.invalidateQueries({ queryKey: qk.task(taskId) })
+}
+
+export function useCommit() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (v: { taskId: string; branch: string; message: string; files: string[] }) =>
+      api.commit(v.taskId, { branch: v.branch, message: v.message, files: v.files }),
+    onSuccess: (_r, v) => invalidateChanges(qc, v.taskId),
+  })
+}
+
+export function usePush() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (taskId: string) => api.push(taskId),
+    onSuccess: (_r, taskId) => invalidateChanges(qc, taskId),
+  })
+}
+
+export function useApplyToRepo() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (v: { taskId: string; files: string[] }) => api.applyToRepo(v.taskId, v.files),
+    onSuccess: (_r, v) => {
+      invalidateChanges(qc, v.taskId)
+      void qc.invalidateQueries({ queryKey: ['repos'] })
+    },
+  })
+}
+
+export function useTerminals(repoId: string | null) {
+  return useQuery({
+    queryKey: qk.terminals(repoId ?? ''),
+    queryFn: () => api.listTerminals(repoId as string),
+    enabled: !!repoId,
+    refetchInterval: 15_000,
+  })
+}
+
+export function useRunCommand() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (v: { taskId: string; command: string; allowNetwork: boolean }) =>
+      api.runCommand(v.taskId, v.command, v.allowNetwork),
+    onSuccess: (command: CommandOut, v) => {
+      // Show the running command immediately; the event stream streams its output and final state.
+      qc.setQueryData<TaskDetail>(qk.task(v.taskId), (old) =>
+        old ? { ...old, commands: [...old.commands.filter((c) => c.id !== command.id), command] } : old,
+      )
+      void qc.invalidateQueries({ queryKey: qk.task(v.taskId) })
+    },
+  })
+}
+
+export function useStopCommand() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (v: { taskId: string; commandId: string }) => api.stopCommand(v.taskId, v.commandId),
+    onSuccess: (_command, v) => {
+      void qc.invalidateQueries({ queryKey: qk.task(v.taskId) })
+      void qc.invalidateQueries({ queryKey: qk.command(v.taskId, v.commandId) })
+    },
   })
 }
 

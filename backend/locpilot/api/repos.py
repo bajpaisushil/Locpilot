@@ -76,7 +76,9 @@ async def delete_repo(repo_id: str, request: Request, delete_clone: bool = False
     repo = db.get_repo(repo_id)
     if repo is None:
         raise ApiError(404, "repo_not_found", "Repository not found.")
+    await request.app.state.terminals.close_where(repo_id=repo_id)
     for task in db.list_tasks(repo_id, limit=10_000):
+        await request.app.state.manager.stop_user_command(task["id"])
         if task.get("worktree_path") and Path(repo["path"]).exists():
             try:
                 await asyncio.to_thread(git.worktree_remove, Path(repo["path"]), Path(task["worktree_path"]),

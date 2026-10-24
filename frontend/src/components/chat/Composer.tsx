@@ -1,9 +1,10 @@
-import { ArrowUpIcon, MessageSquareTextIcon, SquareIcon, WrenchIcon } from 'lucide-react'
+import { ArrowUpIcon, MessageSquareTextIcon, SquareIcon, TerminalIcon, WrenchIcon } from 'lucide-react'
 import { useEffect, useRef } from 'react'
 import { ErrorState } from '@/components/common/States'
 import { Button } from '@/components/ui/button'
 import { Kbd } from '@/components/ui/kbd'
 import { Hint } from '@/components/ui/tooltip'
+import { commandLine, runningUserCommand, sharedUserRuns } from '@/lib/commands'
 import { isActive, useCreateTask, useModelStatus, useSendMessage, useTaskAction } from '@/lib/queries'
 import type { Mode, TaskDetail } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -81,7 +82,9 @@ export function Composer({ repoId, task }: { repoId: string; task: TaskDetail | 
   else if (!aiReady) blockedReason = 'The local model is not ready.'
   else if (running) blockedReason = 'LocPilot is working on this task…'
   else if (awaiting) blockedReason = 'Approve or reject the proposed changes above to continue.'
+  else if (runningUserCommand(task)) blockedReason = 'A command you started is still running — stop it in the Commands tab to continue.'
   const disabled = !!blockedReason || submitting
+  const shared = blockedReason ? [] : sharedUserRuns(task)
 
   useEffect(() => {
     const el = ref.current
@@ -118,6 +121,17 @@ export function Composer({ repoId, task }: { repoId: string; task: TaskDetail | 
     <div className="border-t bg-background/80 px-4 pt-3 pb-4 backdrop-blur">
       <div className="mx-auto max-w-3xl space-y-2">
         {error && <ErrorState error={error} compact />}
+        {shared.length > 0 && (
+          <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground" data-testid="shared-runs">
+            <TerminalIcon className="size-3 shrink-0" />
+            <span className="shrink-0">LocPilot will see the output of</span>
+            {shared.map((c) => (
+              <code key={c.id} className="min-w-0 truncate rounded bg-muted px-1 font-mono">
+                {commandLine(c)}
+              </code>
+            ))}
+          </div>
+        )}
         {!aiReady && model.data && (
           <div className="flex items-center justify-between gap-3 rounded-md border border-warning/30 bg-warning/8 px-3 py-2 text-xs">
             <span>

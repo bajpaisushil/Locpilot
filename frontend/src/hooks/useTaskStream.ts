@@ -48,6 +48,7 @@ export function useTaskStream(taskId: string | null) {
       if (refreshDiff) {
         refreshDiff = false
         void qc.invalidateQueries({ queryKey: qk.diff(taskId) })
+        void qc.invalidateQueries({ queryKey: qk.worktreeChanges(taskId) })
       }
     }
 

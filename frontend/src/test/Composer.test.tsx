@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { Composer } from '@/components/chat/Composer'
 import { useUi } from '@/store/ui'
 import { json, mockFetch, renderWithProviders } from './utils'
-import { modelStatus, taskDetail } from './fixtures'
+import { modelStatus, taskDetail, userCommand } from './fixtures'
 
 describe('Composer', () => {
   beforeEach(() => useUi.setState({ composerMode: 'ask', composerDraft: '', selectedTaskId: null, setupOpen: false }))
@@ -34,6 +34,20 @@ describe('Composer', () => {
     await waitFor(() => expect(useUi.getState().selectedTaskId).toBe('t_9'))
     expect(calls.find((c) => c.method === 'POST')?.body).toEqual({ repo_id: 'r_1', mode: 'code', message: 'Fix the duplicate offers' })
     expect(useUi.getState().composerDraft).toBe('')
+  })
+
+  it('says which of the user\'s runs LocPilot will see, and waits for a running one', async () => {
+    mockFetch({ 'GET /api/model/status': modelStatus() })
+    const done = userCommand({ id: 'c_1', argv: ['python main.py'], exit_code: 1 })
+    const first = renderWithProviders(<Composer repoId="r_1" task={taskDetail({ mode: 'code', commands: [done] })} />)
+    expect(await screen.findByTestId('shared-runs')).toHaveTextContent('python main.py')
+    first.unmount()
+    const running = userCommand({ id: 'c_2', argv: ['npm start'], status: 'running', exit_code: null })
+    renderWithProviders(<Composer repoId="r_1" task={taskDetail({ mode: 'code', commands: [done, running] })} />)
+    const box = screen.getByRole('textbox', { name: /message locpilot/i })
+    await waitFor(() => expect(box).toHaveAttribute('placeholder', expect.stringMatching(/stop it in the commands tab/i)))
+    expect(box).toBeDisabled()
+    expect(screen.queryByTestId('shared-runs')).not.toBeInTheDocument()
   })
 
   it('offers Cancel while a task is running', async () => {

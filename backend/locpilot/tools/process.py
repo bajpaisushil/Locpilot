@@ -162,10 +162,12 @@ async def run_async(
     max_output_bytes: int,
     on_output: OutputCallback | None = None,
     sandbox: str = "none",
+    stop: asyncio.Event | None = None,
 ) -> ProcessResult:
     """Run an approved command with streaming output, a hard timeout and process-tree kill.
 
-    Cancellation of the awaiting task kills the whole process group.
+    Cancellation of the awaiting task kills the whole process group. Setting ``stop``
+    also kills it, but returns normally with the output captured so far (``cancelled``).
     """
     start = time.monotonic()
     kwargs: dict = {}
@@ -211,7 +213,15 @@ async def run_async(
                 pass
 
     pumps = asyncio.gather(pump(proc.stdout, out_buf, "stdout"), pump(proc.stderr, err_buf, "stderr"))
-    timed_out = cancelled = False
+    timed_out = cancelled = stopped = False
+
+    async def watch_stop(event: asyncio.Event) -> None:
+        nonlocal stopped
+        await event.wait()
+        stopped = True
+        kill_tree()
+
+    watcher = asyncio.create_task(watch_stop(stop)) if stop is not None else None
     try:
         await asyncio.wait_for(asyncio.shield(pumps), timeout=timeout)
         await asyncio.wait_for(proc.wait(), timeout=5)
@@ -227,6 +237,8 @@ async def run_async(
             pass
         raise
     finally:
+        if watcher is not None:
+            watcher.cancel()
         if timed_out:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
@@ -237,6 +249,7 @@ async def run_async(
             except (TimeoutError, asyncio.CancelledError):
                 pumps.cancel()
     duration = int((time.monotonic() - start) * 1000)
+    cancelled = cancelled or stopped
     return ProcessResult(
         argv=argv, cwd=str(cwd), exit_code=None if (timed_out or cancelled) else proc.returncode,
         stdout=clean_output(out_buf.text()), stderr=clean_output(err_buf.text()), duration_ms=duration,

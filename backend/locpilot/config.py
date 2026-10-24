@@ -28,9 +28,13 @@ DEFAULT_ORIGINS = [
 ]
 
 
-def _split_list(value: object) -> object:
+def _split_list(value: object, *, path_separator: bool = False) -> object:
+    """Comma-separated env values; folder lists may also use the OS path separator (":" on POSIX).
+    URLs contain ":", so only folder lists split on it."""
     if isinstance(value, str):
-        return [item.strip() for item in value.replace(os.pathsep, ",").split(",") if item.strip()]
+        if path_separator:
+            value = value.replace(os.pathsep, ",")
+        return [item.strip() for item in value.split(",") if item.strip()]
     return value
 
 
@@ -60,6 +64,10 @@ class Settings(BaseSettings):
     clone_timeout_s: int = 600
     git_timeout_s: int = 60
     command_timeout_s: int = 300
+    user_command_timeout_s: int = 900
+    terminal_shell: str | None = None  # default: the user's login shell
+    max_terminals: int = 8
+    terminal_scrollback_chars: int = 400_000
     max_output_bytes: int = 200_000
     sandbox: Literal["auto", "off"] = "auto"
     sandbox_allow_localhost: bool = False
@@ -78,7 +86,7 @@ class Settings(BaseSettings):
     @field_validator("allowed_repo_roots", mode="before")
     @classmethod
     def _parse_roots(cls, value: object) -> object:
-        value = _split_list(value)
+        value = _split_list(value, path_separator=True)
         if isinstance(value, list):
             return [Path(os.path.expanduser(str(v))) for v in value]
         return value

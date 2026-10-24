@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { createJSONStorage, persist } from 'zustand/middleware'
 import type { Mode } from '@/lib/types'
 
-export type RightTab = 'files' | 'changes' | 'commands' | 'details'
+export type RightTab = 'files' | 'changes' | 'commands' | 'terminal' | 'details'
 export type Theme = 'dark' | 'light'
 
 export interface FileTarget {
@@ -20,6 +20,8 @@ interface UiState {
   selectedTaskId: string | null
   composerMode: Mode
   composerDraft: string
+  /** Network access for commands the user runs (writes stay confined to the worktree either way). */
+  runAllowNetwork: boolean
   rightPanelOpen: boolean
   rightTab: RightTab
   fileTarget: FileTarget | null
@@ -33,6 +35,7 @@ interface UiState {
   selectTask: (id: string | null) => void
   setComposerMode: (mode: Mode) => void
   setComposerDraft: (draft: string) => void
+  setRunAllowNetwork: (allow: boolean) => void
   setRightPanelOpen: (open: boolean) => void
   setRightTab: (tab: RightTab) => void
   openFile: (target: Omit<FileTarget, 'nonce'>) => void
@@ -52,6 +55,7 @@ export const useUi = create<UiState>()(
       selectedTaskId: null,
       composerMode: 'ask',
       composerDraft: '',
+      runAllowNetwork: false,
       rightPanelOpen: true,
       rightTab: 'files',
       fileTarget: null,
@@ -66,6 +70,7 @@ export const useUi = create<UiState>()(
       selectTask: (id) => set({ selectedTaskId: id }),
       setComposerMode: (composerMode) => set({ composerMode }),
       setComposerDraft: (composerDraft) => set({ composerDraft }),
+      setRunAllowNetwork: (runAllowNetwork) => set({ runAllowNetwork }),
       setRightPanelOpen: (rightPanelOpen) => set({ rightPanelOpen }),
       setRightTab: (rightTab) => set({ rightTab, rightPanelOpen: true }),
       openFile: (target) =>
@@ -96,6 +101,7 @@ export const useUi = create<UiState>()(
         selectedRepoId: s.selectedRepoId,
         selectedTaskId: s.selectedTaskId,
         composerMode: s.composerMode,
+        runAllowNetwork: s.runAllowNetwork,
         rightPanelOpen: s.rightPanelOpen,
         rightTab: s.rightTab,
         theme: s.theme,

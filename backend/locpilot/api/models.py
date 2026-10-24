@@ -48,6 +48,38 @@ class ApprovalDecision(BaseModel):
     commands: list[list[str]] | None = Field(None, max_length=10)
 
 
+class UserCommandCreate(BaseModel):
+    command: str = Field(min_length=1, max_length=2000)
+    allow_network: bool = False
+
+    @field_validator("command")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("command must not be empty")
+        if "\x00" in value:
+            raise ValueError("command must not contain NUL bytes")
+        return value
+
+
+class FileSelection(BaseModel):
+    files: list[str] = Field(min_length=1, max_length=500)
+
+
+class CommitCreate(FileSelection):
+    message: str = Field(min_length=1, max_length=5000)
+    branch: str = Field(min_length=1, max_length=200)
+
+    @field_validator("message", "branch")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
 class ModelConfigUpdate(BaseModel):
     model: str | None = Field(None, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._\-/:]*$")
     num_ctx: int | None = Field(None, ge=2048, le=131072)

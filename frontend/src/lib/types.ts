@@ -195,6 +195,8 @@ export interface TestSummary {
   skipped: number | null
   total: number | null
   failing_tests: string[]
+  /** Execution notes, e.g. a timeout or a sandbox block. */
+  hints?: string[]
 }
 
 export type CommandStatus = 'running' | 'completed' | 'timed_out' | 'cancelled' | 'error' | 'interrupted'
@@ -277,6 +279,8 @@ export interface ApprovalDecision {
 }
 
 export interface TaskDetail extends TaskSummary {
+  /** Number of the latest conversation turn. */
+  turn: number
   repo: RepoSummary
   workspace_path: string | null
   worktree_path: string | null
@@ -288,6 +292,60 @@ export interface TaskDetail extends TaskSummary {
   commands: CommandOut[]
   pending_approval: ApprovalOut | null
   stats: Record<string, number>
+}
+
+/** An uncommitted change in a task worktree (LocPilot's own edits, or anything else, e.g. from a terminal). */
+export interface WorktreeChangeFile {
+  path: string
+  status: 'A' | 'M' | 'D'
+  locpilot: boolean
+}
+
+/** The branch a task's changes were committed to, and whether it was pushed. */
+export interface PublishState {
+  task_id: string
+  branch: string
+  head: string
+  pushed_head: string | null
+  committed_at: string
+  pushed_at: string | null
+  remote_url: string | null
+  pull_request_url: string | null
+}
+
+export interface WorktreeChanges {
+  base_commit: string | null
+  worktree_path: string
+  files: WorktreeChangeFile[]
+  suggested_branch: string
+  suggested_message: string
+  publish: PublishState | null
+}
+
+export interface CommitResult {
+  commit: string
+  branch: string
+  files: string[]
+  publish: PublishState | null
+}
+
+export interface ApplyResult {
+  applied: string[]
+  repo_path: string
+}
+
+/** An interactive shell: in a task's worktree (LocPilot's version of the code) or the repository folder. */
+export interface TerminalOut {
+  id: string
+  title: string
+  location: 'worktree' | 'repository'
+  cwd: string
+  shell: string
+  repo_id: string
+  task_id: string | null
+  running: boolean
+  exit_code: number | null
+  created_at: string
 }
 
 export interface DiffFile {

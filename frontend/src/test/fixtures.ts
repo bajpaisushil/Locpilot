@@ -1,6 +1,7 @@
 // Test-only data factories. Never imported by application code.
 import type {
   ApprovalOut,
+  CommandOut,
   FinalReport,
   InvestigationReport,
   ModelStatus,
@@ -221,6 +222,18 @@ export function approval(overrides: Partial<ApprovalOut> = {}): ApprovalOut {
   }
 }
 
+/** A command the user ran themselves (stage "user"), finished with exit code 0 unless overridden. */
+export function userCommand(overrides: Partial<CommandOut> = {}): CommandOut {
+  return {
+    id: 'c_1', turn: 1, stage: 'user', argv: ['python main.py'], cwd: '/data/worktrees/t_1', status: 'completed',
+    exit_code: 0, duration_ms: 420, timed_out: false, truncated: false, sandbox: 'seatbelt',
+    summary: { framework: 'unknown', outcome: 'passed', passed: null, failed: null, errors: null, skipped: null,
+               total: null, failing_tests: [], hints: [] },
+    stdout: null, stderr: null, started_at: '2026-10-24T10:02:00Z', finished_at: '2026-10-24T10:02:01Z',
+    ...overrides,
+  }
+}
+
 export function taskDetail(overrides: Partial<TaskDetail> = {}): TaskDetail {
   const repo = repoDetail()
   return {
@@ -243,6 +256,7 @@ export function taskDetail(overrides: Partial<TaskDetail> = {}): TaskDetail {
       created_at: repo.created_at,
       last_opened_at: repo.last_opened_at,
     },
+    turn: 1,
     workspace_path: repo.path,
     worktree_path: null,
     base_commit: null,

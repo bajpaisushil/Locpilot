@@ -51,9 +51,9 @@ flowchart LR
 
 | Package | Responsibility |
 |---|---|
-| `locpilot/api` | HTTP routes: setup/model, repos, tasks, SSE events, approvals, diffs, rollback |
+| `locpilot/api` | HTTP routes: setup/model, repos, tasks, SSE events, approvals, diffs, rollback, your own commands, apply/commit/push, terminals |
 | `locpilot/agent` | LangGraph graph, prompts, schemas, evidence retrieval, citation validation, runner |
-| `locpilot/tools` | File inventory, text/regex search, Tree-sitter/ast symbols, Git, manifests, patch engine, test-output parsing, subprocess runner |
+| `locpilot/tools` | File inventory, text/regex search, Tree-sitter/ast symbols, Git (incl. commit/push/apply on your click), manifests, patch engine, test-output parsing, subprocess runner, PTY terminals |
 | `locpilot/security` | Path confinement, secret detection/redaction, command policy, OS sandbox, HTTP hardening |
 | `locpilot/storage` | SQLite application database |
 | `locpilot/llm` | Ollama client (streaming, schema-constrained JSON, pull) |

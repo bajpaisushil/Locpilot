@@ -1,8 +1,9 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ClipboardCopyIcon, Columns2Icon, DownloadIcon, FileDiffIcon, FilePlusIcon, FileMinusIcon, Rows2Icon, Undo2Icon } from 'lucide-react'
+import { ClipboardCopyIcon, Columns2Icon, DownloadIcon, FileDiffIcon, FilePlusIcon, FileMinusIcon, Rows2Icon, TerminalIcon, Undo2Icon } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { DiffViewer } from '@/components/code/LazyViewers'
+import { SourceControl } from '@/components/panels/SourceControl'
 import { EmptyState, ErrorState, LoadingState } from '@/components/common/States'
 import {
   AlertDialog,
@@ -42,6 +43,7 @@ function FileIconFor({ change }: { change: DiffFile['change'] }) {
 
 export function ChangesTab() {
   const taskId = useUi((s) => s.selectedTaskId)
+  const setRightTab = useUi((s) => s.setRightTab)
   const task = useTask(taskId)
   const hasWorktree = !!task.data?.worktree_path
   const diff = useTaskDiff(taskId, hasWorktree)
@@ -118,6 +120,12 @@ export function ChangesTab() {
             <ClipboardCopyIcon />
           </Button>
         </Hint>
+        <Hint label="Try the changed code: run it in this worktree from the Commands tab">
+          <Button variant="outline" size="xs" onClick={() => setRightTab('commands')}>
+            <TerminalIcon />
+            Run
+          </Button>
+        </Hint>
         <Button variant="outline" size="xs" onClick={() => void savePatch()} disabled={!files.length}>
           <DownloadIcon />
           .patch
@@ -127,6 +135,8 @@ export function ChangesTab() {
           Roll back
         </Button>
       </div>
+
+      {task.data && <SourceControl task={task.data} />}
 
       {rollbackResult && (
         <div className="border-b bg-muted/30 px-3 py-2 text-xs">
@@ -147,7 +157,7 @@ export function ChangesTab() {
       {files.length === 0 ? (
         <EmptyState
           icon={<FileDiffIcon />}
-          title="No changes in the worktree"
+          title="No LocPilot changes in the worktree"
           description="LocPilot has not applied any edits yet (or they were rolled back)."
           className="flex-1"
         />

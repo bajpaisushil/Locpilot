@@ -8,6 +8,9 @@
 * Windows / unavailable: commands run unsandboxed (after explicit approval) and
   the UI says so.
 
+Commands the user runs themselves can opt into network access; writes stay
+confined to the worktree either way.
+
 This is defence in depth, not a security guarantee. A Git worktree is *not* a
 sandbox: it only isolates LocPilot's edits from the user's working tree.
 """
@@ -67,7 +70,8 @@ def detect_sandbox() -> SandboxInfo:
     return SandboxInfo("none", False, "No supported sandbox found; approved commands run with your user rights")
 
 
-def seatbelt_profile(workspace: Path, scratch: Path, data_dir: Path, allow_localhost: bool) -> str:
+def seatbelt_profile(workspace: Path, scratch: Path, data_dir: Path, allow_localhost: bool,
+                     allow_network: bool = False) -> str:
     home = Path.home().resolve()
     ws = workspace.resolve()
     sc = scratch.resolve()
@@ -77,13 +81,17 @@ def seatbelt_profile(workspace: Path, scratch: Path, data_dir: Path, allow_local
     lines = [
         "(version 1)",
         "(allow default)",
-        "(deny network-outbound (remote ip))",
     ]
-    if allow_localhost:
-        lines.append('(allow network-outbound (remote ip "localhost:*"))')
+    if not allow_network:
+        lines.append("(deny network-outbound (remote ip))")
+        if allow_localhost:
+            lines.append('(allow network-outbound (remote ip "localhost:*"))')
+        # DNS (mDNSResponder) and daemon sockets such as Docker's live here.
+        lines += [
+            '(deny network-outbound (remote unix-socket (subpath "/private/var/run")))',
+            '(deny network-outbound (remote unix-socket (subpath "/var/run")))',
+        ]
     lines += [
-        '(deny network-outbound (remote unix-socket (subpath "/private/var/run")))',
-        '(deny network-outbound (remote unix-socket (subpath "/var/run")))',
         f"(deny file-read* {' '.join(deny_reads)})",
         # LocPilot's data dir (other tasks, DB, clones): no file contents or listings, but path metadata stays
         # readable so runtimes can lstat()/realpath() the worktree's parent directories (Node does this).
@@ -108,6 +116,7 @@ def wrap_argv(
     scratch: Path,
     data_dir: Path,
     allow_localhost: bool = False,
+    allow_network: bool = False,
     enabled: bool = True,
 ) -> tuple[list[str], str]:
     """Return (argv to execute, sandbox kind used)."""
@@ -116,8 +125,8 @@ def wrap_argv(
         return argv, "none"
     scratch.mkdir(parents=True, exist_ok=True)
     if info.kind == "seatbelt":
-        profile = scratch / "sandbox.sb"
-        profile.write_text(seatbelt_profile(workspace, scratch, data_dir, allow_localhost))
+        profile = scratch / ("sandbox-net.sb" if allow_network else "sandbox.sb")
+        profile.write_text(seatbelt_profile(workspace, scratch, data_dir, allow_localhost, allow_network))
         return ["/usr/bin/sandbox-exec", "-f", str(profile), *argv], "seatbelt"
     if info.kind == "bwrap":
         bwrap = shutil.which("bwrap") or "bwrap"
@@ -130,7 +139,7 @@ def wrap_argv(
         for d in _SECRET_HOME_DIRS:
             if (home / d).exists():
                 wrapped += ["--tmpfs", str(home / d)]
-        if not allow_localhost:
+        if not allow_localhost and not allow_network:
             wrapped.append("--unshare-net")
         wrapped += ["--unshare-pid", "--die-with-parent", "--new-session", "--chdir", str(workspace), "--", *argv]
         return wrapped, "bwrap"

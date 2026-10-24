@@ -119,6 +119,14 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS task_publish (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  branch TEXT NOT NULL,
+  head TEXT NOT NULL,
+  pushed_head TEXT,
+  committed_at TEXT NOT NULL,
+  pushed_at TEXT
+);
 """
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "needs_input"}
@@ -365,6 +373,20 @@ class Database:
             return
         cols = ", ".join(f"{k}=?" for k in fields)
         self._exec(f"UPDATE patches SET {cols} WHERE id=?", [*fields.values(), patch_id])
+
+    # commits & pushes of a task's changes ------------------------------------------------
+    def get_publish(self, task_id: str) -> dict | None:
+        return self._one("SELECT * FROM task_publish WHERE task_id=?", (task_id,))
+
+    def record_commit(self, task_id: str, *, branch: str, head: str) -> dict:
+        self._exec("INSERT INTO task_publish(task_id, branch, head, committed_at) VALUES(?,?,?,?) "
+                   "ON CONFLICT(task_id) DO UPDATE SET branch=excluded.branch, head=excluded.head, "
+                   "committed_at=excluded.committed_at", (task_id, branch, head, now_iso()))
+        return self.get_publish(task_id)  # type: ignore[return-value]
+
+    def record_push(self, task_id: str, *, head: str) -> dict:
+        self._exec("UPDATE task_publish SET pushed_head=?, pushed_at=? WHERE task_id=?", (head, now_iso(), task_id))
+        return self.get_publish(task_id)  # type: ignore[return-value]
 
     # approvals ------------------------------------------------------------------------
     def add_approval(self, task_id: str, *, kind: str, patch_id: str | None, payload: dict) -> dict:

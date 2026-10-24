@@ -18,7 +18,8 @@ cloud model fallback.
 
 * **Connect a repository** — clone a public GitHub/GitLab/Bitbucket URL into LocPilot's
   workspace, or pick an existing local checkout (native folder picker in the desktop app).
-  Shows branch, HEAD, and working-tree status; never modifies your checkout.
+  Shows branch, HEAD, and working-tree status; never modifies your checkout unless you click
+  **Apply to my repo**.
 * **Ask mode (read-only)** — explanations and root-cause analyses grounded in retrieved
   code: execution flow, files/functions/lines examined, hypotheses with confidence and
   supporting/contradicting evidence, most likely root cause (or an explicit "evidence is
@@ -31,6 +32,17 @@ cloud model fallback.
   a sandbox. Failures are diagnosed from the real output and repaired within strict limits;
   identical failures stop the loop. Rollback, `.patch` download, and follow-ups such as
   "Review your changes for side effects" or "Explain the changes you made".
+* **Run it yourself** — the Commands tab has a command line that runs your command
+  (`python main.py`, `npm run build`, …) on LocPilot's version of the code (the task
+  worktree), sandboxed, with live output and a Stop button. The output goes along with your
+  next message, so "it crashes — fix it" just works.
+* **Terminal** — a real shell like VS Code's (xterm.js) in the task worktree or your repository
+  folder: start your dev server there and LocPilot's next edits reload live; `localhost`
+  links open in your browser; **Send to LocPilot** puts terminal output into your message.
+* **Source control** — VS Code-style: type a commit message, tick files, **Commit** or
+  **Commit & Push** to a `locpilot/…` branch (your checked-out branch is never moved; push uses
+  your own Git credentials and then links to the pull-request page), or **Apply to my repo**
+  to drop the changes into your own folder as uncommitted edits.
 * **Repository intelligence** — `.gitignore`-aware inventory with secret/dependency/build
   exclusions, literal and regex search, Tree-sitter (JS/TS/Go/Java/Rust) and `ast` (Python)
   symbols, callers/callees and static call chains, imports, manifests and test-runner
@@ -108,8 +120,15 @@ remote repository obviously needs the network).
    with real exit codes, durations and test summaries. Inspect the full output in the
    Commands panel and the diff in the Changes panel; download the `.patch`
    (`git apply locpilot-<task>.patch` in your checkout) or roll back.
-6. Continue the conversation: "The tests failed. Investigate the failure and try again.",
-   "Review your changes for possible side effects.", "Explain the changes you made."
+6. Try it: run your command in the **Commands** tab, or open a **Terminal** in LocPilot's
+   worktree and start your app (`npm run dev`, `python app.py`, …) — then click its
+   `localhost` link. LocPilot's files live in that worktree, not in your checkout, so your
+   own editor keeps showing the original code until step 8.
+7. Continue the conversation: "The tests failed. Investigate the failure and try again.",
+   "It crashes when I run it — fix it" (your last runs go along automatically),
+   "Review your changes for possible side effects.", or **Roll back**.
+8. Bring the changes out from the **Changes** tab: **Apply to my repo** (uncommitted edits in
+   your folder), **Commit** to a branch, and **Push** — then open the pull request.
 
 Tasks that were running when the app closed show **Resume**.
 

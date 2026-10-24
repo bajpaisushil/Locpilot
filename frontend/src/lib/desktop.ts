@@ -35,15 +35,22 @@ export async function pickDirectory(): Promise<string | null> {
   return typeof result === 'string' ? result : null
 }
 
-/** Opens an https URL in the user's browser (never inside the app webview). */
+const LOCAL_HTTP = /^http:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d{1,5})?(\/|$)/i
+
+/**
+ * Opens an https URL, or a local dev server such as http://localhost:5173, in the user's browser
+ * (never inside the app webview).
+ */
 export async function openExternal(url: string): Promise<void> {
-  if (!/^https:\/\//i.test(url)) return
+  let target = url.trim()
+  if (LOCAL_HTTP.test(target)) target = target.replace(/^http:\/\/(0\.0\.0\.0|\[::1\])/i, 'http://localhost')
+  else if (!/^https:\/\//i.test(target)) return
   if (isTauri()) {
     const { openUrl } = await import('@tauri-apps/plugin-opener')
-    await openUrl(url)
+    await openUrl(target)
     return
   }
-  window.open(url, '_blank', 'noopener,noreferrer')
+  window.open(target, '_blank', 'noopener,noreferrer')
 }
 
 /** Saves text through a native save dialog (desktop) or a browser download. */

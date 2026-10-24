@@ -13,11 +13,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from locpilot import __version__
 from locpilot.agent.runner import TaskManager
-from locpilot.api import repos, setup, tasks
+from locpilot.api import repos, setup, tasks, terminals
 from locpilot.config import Settings, get_settings
 from locpilot.llm.ollama import LLMClient, OllamaClient
 from locpilot.security.http import LocalSecurityMiddleware
 from locpilot.storage.db import Database
+from locpilot.tools.terminal import TerminalManager
 
 
 def default_llm_factory(settings: Settings, db: Database) -> Callable[[], OllamaClient]:
@@ -39,6 +40,8 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     db = Database(settings.db_path)
     factory = llm_factory or default_llm_factory(settings, db)
     manager = TaskManager(settings, db, factory)
+    terminal_manager = TerminalManager(shell=settings.terminal_shell, max_terminals=settings.max_terminals,
+                                       scrollback_chars=settings.terminal_scrollback_chars)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -49,6 +52,7 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
             job = app.state.pull.get("task")
             if job is not None and not job.done():
                 job.cancel()
+            await terminal_manager.shutdown()
             await manager.shutdown()
             db.close()
 
@@ -57,6 +61,7 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     app.state.settings = settings
     app.state.db = db
     app.state.manager = manager
+    app.state.terminals = terminal_manager
     app.state.llm_factory = factory
     app.state.pull = {"model": None, "state": "idle", "status_text": "", "completed": None, "total": None,
                       "error": None}
@@ -93,4 +98,5 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     app.include_router(setup.router)
     app.include_router(repos.router)
     app.include_router(tasks.router)
+    app.include_router(terminals.router)
     return app

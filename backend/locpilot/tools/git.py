@@ -1,11 +1,17 @@
 """Git CLI wrapper.
 
 Read operations run with ``GIT_OPTIONAL_LOCKS=0`` so they never take the index
-lock or rewrite the user's index. The only write operations LocPilot performs
-are ``clone`` (into its own workspace, on explicit user request) and
+lock or rewrite the user's index. LocPilot's own write operations are
+``clone`` (into its own workspace, on explicit user request) and
 ``worktree add/remove`` for its own isolated task worktrees. Hooks are disabled
-for both. LocPilot never commits, pushes, stashes, resets or checks out in the
+for all of them. LocPilot never commits, pushes, stashes, resets or checks out in the
 user's working tree.
+
+Three more writes happen only when the user clicks for them: committing a task
+worktree's changes to a new branch (the worktree stays detached, so the branch
+remains free to check out), pushing that branch with the user's own Git
+credentials, and applying the changes to the user's working tree as plain file
+edits (never their index, HEAD or branches).
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from locpilot.tools.process import ProcessResult, base_env, run_sync
 
@@ -261,6 +267,157 @@ def worktree_remove(repo: Path, dest: Path, *, managed_root: Path) -> None:
     if not result.ok and resolved.exists():
         shutil.rmtree(resolved, ignore_errors=True)
     _git(["worktree", "prune"], repo, timeout=60, check=False)
+
+
+# --- Explicit user actions: bring a worktree's changes out ----------------------------
+
+# LocPilot links the user's node_modules into worktrees; the link is never part of a change.
+WORKTREE_ARTIFACTS = frozenset({"node_modules"})
+MAX_CHANGED_FILES = 500
+_ZERO_OID = ""  # `git update-ref <ref> <new> ""` succeeds only if <ref> does not exist yet
+
+
+def _user_git_env() -> dict[str, str]:
+    """The user's own environment (credential helpers, SSH agent, commit signing) minus LocPilot's secrets."""
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("LOCPILOT_")}
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1", "LC_ALL": "C"})
+    return env
+
+
+def _git_as_user(args: list[str], cwd: Path, *, timeout: float) -> ProcessResult:
+    exe = git_executable()
+    if not exe:
+        raise GitError("Git is not installed or not on PATH")
+    result = run_sync([exe, "-c", "core.quotepath=off", *args], cwd, timeout=timeout, env=_user_git_env())
+    if not result.ok:
+        message = (result.stderr or result.stdout or result.error or "git failed").strip()
+        if result.timed_out:
+            message = f"git {args[-1] if args else ''} timed out after {timeout:.0f}s"
+        raise GitError(sanitize_git_message(message))
+    return result
+
+
+def worktree_changes(worktree: Path) -> list[StatusFile]:
+    """Uncommitted changes in a task worktree (untracked files listed one by one), LocPilot's link excluded."""
+    result = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], worktree, timeout=60)
+    files: list[StatusFile] = []
+    for entry in result.stdout.split("\0"):
+        if len(entry) < 4 or entry[3:] in WORKTREE_ARTIFACTS:
+            continue
+        xy, path = entry[:2], entry[3:]
+        code = "A" if xy == "??" or "A" in xy else "D" if "D" in xy else "M"
+        files.append(StatusFile(path, code))
+        if len(files) >= MAX_CHANGED_FILES:
+            break
+    return files
+
+
+def valid_branch_name(name: str) -> bool:
+    if not name or name.startswith("-") or len(name) > 200:
+        return False
+    return _git(["check-ref-format", f"refs/heads/{name}"], Path.cwd(), timeout=10, check=False).ok
+
+
+def branch_tip(repo: Path, branch: str) -> str | None:
+    result = _git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], repo, timeout=15, check=False)
+    if not result.ok:
+        return None
+    return result.stdout.strip() or None
+
+
+def branch_checked_out_at(repo: Path, branch: str) -> str | None:
+    """The working tree (main checkout or another worktree) that has ``branch`` checked out, if any."""
+    result = _git(["worktree", "list", "--porcelain"], repo, timeout=30)
+    current = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}":
+            return current
+    return None
+
+
+def _stage_only(worktree: Path, files: list[str]) -> None:
+    """Make the worktree's index (LocPilot's own) equal HEAD plus exactly these files."""
+    _git(["reset", "-q"], worktree, timeout=60)
+    _git(["add", "-A", "--", *files], worktree, timeout=120)
+
+
+def commit_to_branch(worktree: Path, *, branch: str, message: str, files: list[str], expected_tip: str | None,
+                     hooks_dir: Path) -> str:
+    """Commit ``files`` from a task worktree and point ``branch`` at the commit; returns the commit id.
+
+    The worktree stays detached, so the branch is never checked out by LocPilot and the user can check it
+    out anywhere. The branch is created only if it does not exist, or advanced only from ``expected_tip``
+    (LocPilot's previous commit for this task): a branch moved by anyone else is never overwritten.
+    """
+    holder = branch_checked_out_at(worktree, branch)
+    if holder is not None:
+        raise GitError(f"Branch {branch} is checked out in {holder}. Choose another branch name, or switch that "
+                       "checkout to a different branch first.")
+    tip = branch_tip(worktree, branch)
+    if tip is not None and tip != expected_tip:
+        raise GitError(f"Branch {branch} already exists. Choose another branch name.")
+    if expected_tip is not None and head_commit(worktree) != expected_tip:
+        raise GitError("The worktree is no longer at LocPilot's last commit (was it changed from a terminal?). "
+                       "Commit from the terminal instead.")
+    _stage_only(worktree, files)
+    _git_as_user(["-c", f"core.hooksPath={hooks_dir}", "commit", "-q", "-m", message], worktree, timeout=120)
+    commit = head_commit(worktree)
+    if not commit:
+        raise GitError("The commit was not created.")
+    _git(["update-ref", "-m", "LocPilot: commit task changes", f"refs/heads/{branch}", commit,
+          expected_tip or _ZERO_OID], worktree, timeout=30)
+    return commit
+
+
+def push_branch(worktree: Path, branch: str, *, timeout: float, hooks_dir: Path) -> None:
+    """Push ``branch`` to ``origin`` with the user's own Git credentials (explicit user action)."""
+    if not _git(["remote", "get-url", "origin"], worktree, timeout=15, check=False).ok:
+        raise GitError("This repository has no 'origin' remote to push to.")
+    _git_as_user(["-c", f"core.hooksPath={hooks_dir}", "push", "--porcelain", "-u", "origin",
+                  f"refs/heads/{branch}:refs/heads/{branch}"], worktree, timeout=timeout)
+
+
+def apply_to_checkout(worktree: Path, repo: Path, *, base: str, files: list[str], patch_file: Path) -> None:
+    """Write the worktree's changes to ``files`` (relative to ``base``) into the user's working tree.
+
+    Plain file edits via ``git apply``: the user's index, HEAD and branches are untouched, and nothing is
+    written unless the whole patch applies (a conflicting local edit makes it refuse).
+    """
+    _stage_only(worktree, files)
+    try:
+        diff = _git(["diff", "--cached", "--binary", "--no-color", "--no-ext-diff", base, "--", *files],
+                    worktree, timeout=120)
+    finally:
+        _git(["reset", "-q"], worktree, timeout=60, check=False)
+    if not diff.stdout.strip():
+        raise GitError("These files have no changes to apply.")
+    patch_file.parent.mkdir(parents=True, exist_ok=True)
+    patch_file.write_text(diff.stdout)
+    check = _git(["apply", "--check", str(patch_file)], repo, timeout=60, check=False)
+    if not check.ok:
+        raise GitError("The changes do not apply cleanly to your repository (it has different local edits or "
+                       "commits in these files): " + sanitize_git_message((check.stderr or check.stdout).strip()))
+    _git(["apply", str(patch_file)], repo, timeout=60)
+
+
+def pull_request_url(remote: str | None, branch: str, hosts: list[str]) -> str | None:
+    """A "create pull request" page for GitHub/GitLab/Bitbucket remotes, else None."""
+    if not remote:
+        return None
+    try:
+        parsed = parse_remote_url(remote, hosts)
+    except ValueError:
+        return None
+    base = f"https://{parsed.host}/{parsed.owner}/{parsed.repo}"
+    if parsed.host == "github.com":
+        return f"{base}/compare/{quote(branch, safe='/')}?expand=1"
+    if parsed.host == "gitlab.com":
+        return f"{base}/-/merge_requests/new?merge_request%5Bsource_branch%5D={quote(branch, safe='')}"
+    if parsed.host == "bitbucket.org":
+        return f"{base}/pull-requests/new?source={quote(branch, safe='')}"
+    return None
 
 
 # --- URL validation ------------------------------------------------------------------

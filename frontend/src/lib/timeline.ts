@@ -1,3 +1,4 @@
+import { isUserCommand } from './commands'
 import type {
   ApprovalOut,
   CommandOut,
@@ -267,6 +268,7 @@ export function buildTurns(detail: TaskDetail | null | undefined, events: TaskEv
       case 'command_started':
       case 'command_finished': {
         const cmd = ev.data.command
+        if (isUserCommand(cmd)) break // the user's own runs live in the Commands tab, not in a turn
         const existing = commandItems.get(cmd.id)
         if (existing) existing.command = { ...existing.command, ...cmd }
         else {

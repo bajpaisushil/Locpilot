@@ -147,6 +147,16 @@ async def test_task_creation_requires_a_model(api, tmp_path):
     assert setup["ollama_install"] and setup["model_install"][0]["command"].startswith("ollama pull")
 
 
+def test_env_lists_keep_urls_intact(monkeypatch, tmp_path):
+    from locpilot.config import Settings
+
+    monkeypatch.setenv("LOCPILOT_ALLOWED_ORIGINS", "http://127.0.0.1:5430, http://localhost:5430")
+    monkeypatch.setenv("LOCPILOT_ALLOWED_REPO_ROOTS", f"{tmp_path / 'a'}:{tmp_path / 'b'},{tmp_path / 'c'}")
+    s = Settings()
+    assert s.allowed_origins == ["http://127.0.0.1:5430", "http://localhost:5430"]
+    assert s.allowed_repo_roots == [tmp_path / "a", tmp_path / "b", tmp_path / "c"]
+
+
 def test_remote_ollama_is_refused_by_default():
     client = OllamaClient("https://api.example.com", "m")
     with pytest.raises(Exception) as info:
@@ -204,6 +214,235 @@ async def test_full_task_flow_over_http_with_diff_patch_and_rollback(api, tmp_pa
     # Delete removes the worktree but never touches the user's repository.
     assert (await client.delete(f"/api/tasks/{task_id}", headers=H)).json()["ok"]
     assert not worktree.exists() and (repo / "offers/aggregator.py").exists()
+
+
+async def _wait_until_false(predicate, task_id: str) -> None:
+    for _ in range(600):
+        if not predicate(task_id):
+            return
+        await asyncio.sleep(0.05)
+    raise TimeoutError(f"{predicate.__name__} stayed true")
+
+
+async def test_user_commands_run_in_the_worktree_and_reach_the_next_turn(api, tmp_path):
+    script = hotel_script()
+    seen: dict[str, list[str]] = {"understand": [], "review": []}
+
+    def capture(step: str, value: dict):
+        def responder(messages):
+            seen[step].append(messages[1]["content"])
+            return value
+        return responder
+
+    fake = FakeLLM(script)
+    app, client = await api(fake)
+    manager = app.state.manager
+    repo = make_repo(tmp_path / "hotel", "hotel-offers")
+    (repo / ".venv" / "bin").mkdir(parents=True)  # ignored by Git: only exists in the user's checkout
+    (repo / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    rid = (await client.post("/api/repos", json={"source": "local", "path": str(repo)}, headers=H)).json()["id"]
+    task_id = (await client.post("/api/tasks", json={"repo_id": rid, "mode": "code", "message": "Fix duplicate offers"},
+                                 headers=H)).json()["id"]
+    await _wait_until_false(manager.is_running, task_id)
+    detail = (await client.get(f"/api/tasks/{task_id}")).json()
+    worktree = Path(detail["worktree_path"])
+    approval = detail["pending_approval"]
+    decision = {"decision": "approve", "commands": [c["argv"] for c in approval["payload"]["commands"]]}
+
+    # While the user's command runs, approving (which edits the worktree) and a second command are refused.
+    r = await client.post(f"/api/tasks/{task_id}/commands",
+                          json={"command": "echo waiting; touch started.flag; sleep 30"}, headers=H)
+    assert r.status_code == 202 and r.json()["stage"] == "user" and r.json()["status"] == "running"
+    long_id = r.json()["id"]
+    for _ in range(200):
+        if (worktree / "started.flag").exists():
+            break
+        await asyncio.sleep(0.05)
+    r = await client.post(f"/api/tasks/{task_id}/approvals/{approval['id']}", json=decision, headers=H)
+    assert r.status_code == 409 and r.json()["error"] == "approval_conflict"
+    assert (await client.post(f"/api/tasks/{task_id}/commands", json={"command": "true"}, headers=H)).status_code == 409
+    r = await client.post(f"/api/tasks/{task_id}/commands/{long_id}/stop", headers=H)
+    assert r.status_code == 200 and r.json()["status"] == "cancelled" and r.json()["exit_code"] is None
+    assert "waiting" in (await client.get(f"/api/tasks/{task_id}/commands/{long_id}")).json()["stdout"]
+    assert (await client.post(f"/api/tasks/{task_id}/commands/{long_id}/stop", headers=H)).status_code == 409
+
+    assert (await client.post(f"/api/tasks/{task_id}/approvals/{approval['id']}", json=decision,
+                              headers=H)).status_code == 200
+    await _wait_until_false(manager.is_running, task_id)
+    assert (await client.get(f"/api/tasks/{task_id}")).json()["status"] == "completed"
+
+    command = ('echo hello-from-run; pwd; touch created-by-run.txt; echo "CI=${CI-unset} VENV=${VIRTUAL_ENV-none}"; '
+               'echo "File \\"$PWD/offers/aggregator.py\\", line 14"; exit 3')
+    r = await client.post(f"/api/tasks/{task_id}/commands", json={"command": command}, headers=H)
+    assert r.status_code == 202
+    await _wait_until_false(manager.user_command_running, task_id)
+    run = (await client.get(f"/api/tasks/{task_id}/commands/{r.json()['id']}")).json()
+    assert run["status"] == "completed" and run["exit_code"] == 3 and run["argv"] == [command]
+    assert "hello-from-run" in run["stdout"] and str(worktree.resolve()) in run["stdout"]
+    assert "CI=unset" in run["stdout"] and f"VENV={repo / '.venv'}" in run["stdout"]
+    assert (worktree / "created-by-run.txt").exists() and not (repo / "created-by-run.txt").exists()
+
+    # The next turn sees what the user ran: in the context, and first in the verification output.
+    fake.script["understand"] = capture("understand", {**script["understand"], "intent": "review_changes",
+                                                       "relates_to_previous": True})
+    fake.script["review"] = capture("review", script["review"])
+    r = await client.post(f"/api/tasks/{task_id}/messages", json={"message": "It exits with 3. Review your changes."},
+                          headers=H)
+    assert r.status_code == 200
+    await _wait_until_false(manager.is_running, task_id)
+    assert "Commands the user just ran" in seen["understand"][-1] and "hello-from-run" in seen["understand"][-1]
+    review_prompt = seen["review"][-1]
+    assert "(run by the user)" in review_prompt and "exit code: 3 | status: completed" in review_prompt
+    assert 'File "offers/aggregator.py", line 14' in review_prompt  # worktree paths made repository-relative
+    assert "Commands the user just ran" not in review_prompt  # not repeated in the general context
+
+
+async def test_user_commands_need_a_worktree_and_a_command(api, tmp_path):
+    app, client = await api(FakeLLM(hotel_script()))
+    repo = make_repo(tmp_path / "hotel", "hotel-offers")
+    rid = (await client.post("/api/repos", json={"source": "local", "path": str(repo)}, headers=H)).json()["id"]
+    task = app.state.db.create_task(repo_id=rid, title="Explain offers", mode="ask", model="fake")
+    r = await client.post(f"/api/tasks/{task['id']}/commands", json={"command": "ls"}, headers=H)
+    assert r.status_code == 400 and r.json()["error"] == "no_worktree"
+    r = await client.post(f"/api/tasks/{task['id']}/commands", json={"command": "   "}, headers=H)
+    assert r.status_code == 422
+    r = await client.post(f"/api/tasks/{task['id']}/commands", json={"command": "ls"})  # no client header
+    assert r.status_code == 403
+
+
+@pytest.fixture
+def git_identity(tmp_path, monkeypatch):
+    """Commits made for the user use their Git config; give the tests a hermetic one."""
+    config = tmp_path / "gitconfig"
+    config.write_text("[user]\n\tname = LocPilot Tests\n\temail = tests@example.invalid\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+async def _completed_code_task(client, manager, repo: Path) -> dict:
+    rid = (await client.post("/api/repos", json={"source": "local", "path": str(repo)}, headers=H)).json()["id"]
+    task_id = (await client.post("/api/tasks", json={"repo_id": rid, "mode": "code", "message": "Fix duplicate offers"},
+                                 headers=H)).json()["id"]
+    await _wait_until_false(manager.is_running, task_id)
+    approval = (await client.get(f"/api/tasks/{task_id}")).json()["pending_approval"]
+    await client.post(f"/api/tasks/{task_id}/approvals/{approval['id']}", headers=H,
+                      json={"decision": "approve", "commands": [c["argv"] for c in approval["payload"]["commands"]]})
+    await _wait_until_false(manager.is_running, task_id)
+    detail = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert detail["status"] == "completed"
+    return detail
+
+
+async def test_apply_commit_and_push_the_task_changes(api, tmp_path, git_identity):
+    import subprocess
+
+    def g(cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    app, client = await api(FakeLLM(hotel_script()))
+    repo = make_repo(tmp_path / "hotel", "hotel-offers")
+    origin = tmp_path / "origin.git"
+    g(tmp_path, "init", "-q", "--bare", str(origin))
+    g(repo, "remote", "add", "origin", str(origin))
+    detail = await _completed_code_task(client, app.state.manager, repo)
+    task_id, worktree = detail["id"], Path(detail["worktree_path"])
+    (worktree / "notes.txt").write_text("scratch made from a terminal\n")
+    head_before = g(repo, "rev-parse", "HEAD")
+
+    changes = (await client.get(f"/api/tasks/{task_id}/worktree-changes")).json()
+    files = {f["path"]: f for f in changes["files"]}
+    assert set(files) == {"offers/aggregator.py", "tests/test_cross_supplier_duplicates.py", "notes.txt"}
+    assert files["offers/aggregator.py"] == {"path": "offers/aggregator.py", "status": "M", "locpilot": True}
+    assert files["notes.txt"]["status"] == "A" and not files["notes.txt"]["locpilot"]
+    assert changes["suggested_branch"] == "locpilot/fix-duplicate-offers"
+    assert changes["suggested_message"] == "Deduplicate across suppliers" and changes["publish"] is None
+
+    # Apply to the user's checkout: plain file edits only (index, HEAD and branch untouched).
+    r = await client.post(f"/api/tasks/{task_id}/apply-to-repo", json={"files": ["offers/aggregator.py"]}, headers=H)
+    assert r.status_code == 200, r.text
+    assert (repo / "offers/aggregator.py").read_text() == (worktree / "offers/aggregator.py").read_text()
+    assert g(repo, "status", "--porcelain") == "M offers/aggregator.py"
+    assert g(repo, "rev-parse", "HEAD") == head_before and g(repo, "branch", "--show-current") == "main"
+    r = await client.post(f"/api/tasks/{task_id}/apply-to-repo", json={"files": ["offers/aggregator.py"]}, headers=H)
+    assert r.status_code == 409 and r.json()["error"] == "apply_failed"  # already there: refuses, writes nothing
+    r = await client.post(f"/api/tasks/{task_id}/apply-to-repo", json={"files": ["README.md"]}, headers=H)
+    assert r.status_code == 400 and r.json()["error"] == "not_changed"
+
+    # Commit only the selected files to a new branch; the worktree stays detached, the checkout untouched.
+    branch = changes["suggested_branch"]
+    selected = ["offers/aggregator.py", "tests/test_cross_supplier_duplicates.py"]
+    r = await client.post(f"/api/tasks/{task_id}/commit", headers=H,
+                          json={"branch": branch, "message": "Deduplicate offers across suppliers", "files": selected})
+    assert r.status_code == 200, r.text
+    first = r.json()["commit"]
+    assert g(repo, "rev-parse", branch) == first and g(repo, "log", "-1", "--format=%s", branch) == \
+        "Deduplicate offers across suppliers"
+    assert set(g(repo, "show", "--name-only", "--format=", branch).splitlines()) == set(selected)
+    assert g(repo, "rev-parse", "HEAD") == head_before and g(repo, "branch", "--show-current") == "main"
+    assert subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=worktree).returncode != 0  # still detached
+    remaining = (await client.get(f"/api/tasks/{task_id}/worktree-changes")).json()
+    assert [f["path"] for f in remaining["files"]] == ["notes.txt"] and remaining["suggested_branch"] == branch
+
+    # A second commit advances the same branch.
+    r = await client.post(f"/api/tasks/{task_id}/commit", headers=H,
+                          json={"branch": branch, "message": "Add notes", "files": ["notes.txt"]})
+    assert r.status_code == 200, r.text
+    assert g(repo, "rev-parse", f"{branch}~1") == first
+
+    # Push with the user's Git setup (a local bare repo stands in for GitHub here).
+    r = await client.post(f"/api/tasks/{task_id}/push", headers=H)
+    assert r.status_code == 200, r.text
+    publish = r.json()["publish"]
+    assert g(origin, "rev-parse", f"refs/heads/{branch}") == publish["head"] == publish["pushed_head"]
+    assert publish["pull_request_url"] is None  # not a GitHub/GitLab/Bitbucket remote
+
+    # Never moves a branch someone else advanced, nor one checked out in a working tree, nor a bad name.
+    g(repo, "branch", "-f", branch, "main")
+    (worktree / "more.txt").write_text("x\n")
+    r = await client.post(f"/api/tasks/{task_id}/commit", headers=H,
+                          json={"branch": branch, "message": "More", "files": ["more.txt"]})
+    assert r.status_code == 409 and "already exists" in r.json()["detail"]
+    r = await client.post(f"/api/tasks/{task_id}/commit", headers=H,
+                          json={"branch": "main", "message": "More", "files": ["more.txt"]})
+    assert r.status_code == 409 and "checked out" in r.json()["detail"]
+    r = await client.post(f"/api/tasks/{task_id}/commit", headers=H,
+                          json={"branch": "bad..name", "message": "More", "files": ["more.txt"]})
+    assert r.status_code == 400 and r.json()["error"] == "invalid_branch"
+
+
+async def test_publishing_needs_a_worktree_and_a_commit(api, tmp_path):
+    app, client = await api(FakeLLM(hotel_script()))
+    repo = make_repo(tmp_path / "hotel", "hotel-offers")
+    rid = (await client.post("/api/repos", json={"source": "local", "path": str(repo)}, headers=H)).json()["id"]
+    task = app.state.db.create_task(repo_id=rid, title="Explain offers", mode="ask", model="fake")
+    assert (await client.get(f"/api/tasks/{task['id']}/worktree-changes")).status_code == 400
+    r = await client.post(f"/api/tasks/{task['id']}/push", headers=H)
+    assert r.status_code == 400
+
+
+def test_branch_names_keep_whole_words():
+    from locpilot.api.tasks import _branch_slug
+
+    assert _branch_slug("Users see duplicate hotel offers in search results when the same room") == \
+        "users-see-duplicate-hotel-offers-in"
+    assert _branch_slug("Fix duplicate offers") == "fix-duplicate-offers"
+    assert _branch_slug("Ünïcode ✨ only!!") == "n-code-only"
+    assert _branch_slug("!!!") == "changes"
+    assert _branch_slug("x" * 60) == "x" * 40
+
+
+def test_pull_request_urls():
+    from locpilot.tools.git import pull_request_url
+
+    hosts = ["github.com", "gitlab.com", "bitbucket.org"]
+    assert pull_request_url("https://github.com/acme/shop.git", "locpilot/fix-a", hosts) == \
+        "https://github.com/acme/shop/compare/locpilot/fix-a?expand=1"
+    assert pull_request_url("git@github.com:acme/shop.git", "b", hosts) == "https://github.com/acme/shop/compare/b?expand=1"
+    assert pull_request_url("https://gitlab.com/acme/shop", "x/y", hosts).endswith("source_branch%5D=x%2Fy")
+    assert pull_request_url("https://bitbucket.org/acme/shop", "b", hosts) == \
+        "https://bitbucket.org/acme/shop/pull-requests/new?source=b"
+    assert pull_request_url("/srv/git/shop.git", "b", hosts) is None
+    assert pull_request_url(None, "b", hosts) is None
 
 
 def _free_port() -> int:

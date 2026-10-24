@@ -1,6 +1,8 @@
 import type {
+  ApplyResult,
   ApprovalDecision,
   CommandOut,
+  CommitResult,
   FileContent,
   HealthResponse,
   ModelConfigUpdate,
@@ -16,7 +18,10 @@ import type {
   TaskDetail,
   TaskDiff,
   TaskSummary,
+  TerminalOut,
   TreeEntry,
+  WorktreeChanges,
+  PublishState,
 } from './types'
 
 /**
@@ -177,7 +182,28 @@ export const api = {
   taskDiff: (id: string) => request<TaskDiff>('GET', `/api/tasks/${enc(id)}/diff`),
   command: (taskId: string, commandId: string) =>
     request<CommandOut>('GET', `/api/tasks/${enc(taskId)}/commands/${enc(commandId)}`),
+  /** Runs a command the user typed in the task worktree; returns the running command record. */
+  runCommand: (taskId: string, command: string, allowNetwork: boolean) =>
+    request<CommandOut>('POST', `/api/tasks/${enc(taskId)}/commands`, { command, allow_network: allowNetwork }),
+  stopCommand: (taskId: string, commandId: string) =>
+    request<CommandOut>('POST', `/api/tasks/${enc(taskId)}/commands/${enc(commandId)}/stop`, {}),
   rollback: (id: string) => request<RollbackResult>('POST', `/api/tasks/${enc(id)}/rollback`, {}),
+
+  worktreeChanges: (id: string) => request<WorktreeChanges>('GET', `/api/tasks/${enc(id)}/worktree-changes`),
+  /** Writes the selected changes into the user's own working tree (plain file edits). */
+  applyToRepo: (id: string, files: string[]) =>
+    request<ApplyResult>('POST', `/api/tasks/${enc(id)}/apply-to-repo`, { files }),
+  commit: (id: string, body: { branch: string; message: string; files: string[] }) =>
+    request<CommitResult>('POST', `/api/tasks/${enc(id)}/commit`, body),
+  push: (id: string) => request<{ publish: PublishState }>('POST', `/api/tasks/${enc(id)}/push`, {}),
+
+  listTerminals: (repoId: string) => request<TerminalOut[]>('GET', `/api/terminals${q({ repo_id: repoId })}`),
+  openTerminal: (body: { repo_id: string; task_id?: string | null; cols: number; rows: number }) =>
+    request<TerminalOut>('POST', '/api/terminals', body),
+  terminalInput: (id: string, data: string) => request<void>('POST', `/api/terminals/${enc(id)}/input`, { data }),
+  resizeTerminal: (id: string, cols: number, rows: number) =>
+    request<void>('POST', `/api/terminals/${enc(id)}/resize`, { cols, rows }),
+  closeTerminal: (id: string) => request<{ ok: boolean }>('DELETE', `/api/terminals/${enc(id)}`),
 
   /** Fetches the LocPilot patch as text (auth headers can't be attached to a plain link). */
   async patchText(id: string): Promise<string> {

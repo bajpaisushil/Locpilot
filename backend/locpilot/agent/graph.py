@@ -46,7 +46,7 @@ from locpilot.agent.schemas import (
     LLMTestSpec,
     TaskUnderstanding,
 )
-from locpilot.agent.workspace import WorkspaceError, prepare_worktree, run_verification_command
+from locpilot.agent.workspace import USER_STAGE, WorkspaceError, prepare_worktree, run_verification_command
 from locpilot.config import Settings
 from locpilot.llm.ollama import LLMClient, LLMResponseError, chat_json
 from locpilot.security.commands import CommandPolicyError, validate_command
@@ -110,6 +110,7 @@ class AgentState(TypedDict, total=False):
     before_runs: list[dict]
     runs: list[dict]
     last_runs: list[dict]
+    user_runs: list[dict]
     applied_patch_ids: list[str]
     verification: dict | None
     failure_signatures: list[str]
@@ -145,8 +146,12 @@ class AgentDeps:
     emitter: Any  # Callable[[task_id, turn, type, data, persist], Awaitable[dict]]
 
 
-def turn_input(carry: dict, *, task_id: str, repo: dict, turn: int, mode: str, request: str) -> dict:
-    """Initial state for a new turn: persistent context + fresh per-turn fields."""
+def turn_input(carry: dict, *, task_id: str, repo: dict, turn: int, mode: str, request: str,
+               user_runs: list[dict] | None = None) -> dict:
+    """Initial state for a new turn: persistent context + fresh per-turn fields.
+
+    ``user_runs`` are command records the user ran in the worktree since the previous turn.
+    """
     state = {k: carry[k] for k in PERSISTENT_KEYS if k in carry and carry[k] is not None}
     state.update({
         "task_id": task_id, "repo_id": repo["id"], "repo_path": repo["path"], "turn": turn, "mode": mode,
@@ -158,6 +163,7 @@ def turn_input(carry: dict, *, task_id: str, repo: dict, turn: int, mode: str, r
         "repair_target": "code", "test_repair_needed": False, "before_checked_for": None, "review": None, "clarifying_question": None,
         "unresolved": [], "warnings": [], "llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
         "tool_calls": 0, "turn_started": time.time(), "final_status": "", "task_status": "running",
+        "user_runs": [run_entry(r) for r in user_runs or []],
     })
     state.setdefault("history", [])
     state.setdefault("evidence", [])
@@ -250,6 +256,15 @@ def _focus_output(stdout: str, stderr: str, max_chars: int = 3500) -> str:
     return text[-max_chars:]
 
 
+def run_entry(row: dict) -> dict:
+    """A finished command record as the agent sees it, with worktree paths made repository-relative."""
+    output = _focus_output(row["stdout"] or "", row["stderr"] or "")
+    if row.get("cwd"):
+        output = output.replace(row["cwd"].rstrip("/\\") + "/", "")
+    return {"stage": row["stage"], "command_id": row["id"], "argv": row["argv"], "exit_code": row["exit_code"],
+            "status": row["status"], "summary": row["summary"], "output": output}
+
+
 class LocPilotGraph:
     def __init__(self, deps: AgentDeps) -> None:
         self.deps = deps
@@ -327,13 +342,15 @@ class LocPilotGraph:
                                        "duration_ms": result.duration_ms})
         return result
 
-    def _context(self, state: AgentState, *, evidence_lines: int | None = None, with_evidence: bool = True) -> str:
+    def _context(self, state: AgentState, *, evidence_lines: int | None = None, with_evidence: bool = True,
+                 with_user_runs: bool = True) -> str:
         overview = state.get("overview") or {}
         summary = overview.get("prompt_summary") or ""
         history = "\n".join(f"- Turn {h['turn']}: user asked \"{h['request'][:200]}\" → {h['headline'][:200]}"
                             for h in (state.get("history") or [])[-4:])
         evidence = render_evidence(state.get("evidence") or [], max_lines_per_item=evidence_lines) if with_evidence else ""
-        return prompts.context_block(summary, evidence, state.get("notes") or [], history)
+        user_runs = self._runs_text(state["user_runs"])[:3500] if with_user_runs and state.get("user_runs") else ""
+        return prompts.context_block(summary, evidence, state.get("notes") or [], history, user_runs)
 
     # nodes --------------------------------------------------------------------------
     async def start_turn(self, state: AgentState) -> dict:
@@ -807,7 +824,8 @@ class LocPilotGraph:
             allowed = set(touched) | set(fix_files) | ({test_path} if test_path else set())
             files_text = "\n\n".join(self._file_block(index, p) for p in sorted(allowed))
             diag = state.get("diagnosis") or {}
-            prompt = prompts.REPAIR.format(runs=self._runs_text(state.get("last_runs") or state.get("runs") or []),
+            prompt = prompts.REPAIR.format(runs=self._runs_text((state.get("user_runs") or [])
+                                                                + (state.get("last_runs") or state.get("runs") or [])),
                                            diagnosis=f"{diag.get('diagnosis', '')}\nNext step: {diag.get('next_step', '')}",
                                            files=files_text, allowed=", ".join(sorted(allowed)),
                                            rules=prompts.EDIT_RULES.format(example_path=sorted(allowed)[0]))
@@ -1120,14 +1138,13 @@ class LocPilotGraph:
             except CommandPolicyError as exc:
                 await self.log(state, f"Command blocked by policy: {exc}", "error")
                 continue
-            runs.append({"stage": stage, "command_id": row["id"], "argv": argv, "exit_code": row["exit_code"],
-                         "status": row["status"], "summary": row["summary"],
-                         "output": _focus_output(row["stdout"] or "", row["stderr"] or "")})
+            runs.append(run_entry(row))
         outcomes = ", ".join(f"{(r['summary'] or {}).get('outcome', 'unknown')} (exit {r['exit_code']})" for r in runs)
         await self.phase(state, "verify", label, "completed", outcomes or "no commands ran")
         if stage == "before_fix":
             return {"before_runs": runs}
-        return {"runs": (state.get("runs") or []) + runs, "last_runs": runs}
+        # A fresh verification of the current code supersedes what the user observed before it.
+        return {"runs": (state.get("runs") or []) + runs, "last_runs": runs, "user_runs": []}
 
     def route_after_verify(self, state: AgentState) -> str:
         return "apply" if state.get("verify_stage") == "before_fix" and state.get("apply_stage") == "tests" else "evaluate"
@@ -1173,11 +1190,21 @@ class LocPilotGraph:
         parts = []
         for r in runs:
             s = r.get("summary") or {}
-            parts.append(f"$ {' '.join(r['argv'])}\nexit code: {r['exit_code']} | outcome: {s.get('outcome')} | "
+            by_user = r.get("stage") == USER_STAGE
+            header = f"$ {' '.join(r['argv'])}" + ("   (run by the user)" if by_user else "")
+            if by_user and s.get("framework") in (None, "unknown"):  # not a test run: the exit code says it all
+                stats = f"exit code: {r['exit_code']} | status: {r['status']}"
+            else:
+                stats = (f"exit code: {r['exit_code']} | outcome: {s.get('outcome')} | "
                          f"passed={s.get('passed')} failed={s.get('failed')} errors={s.get('errors')}\n"
-                         f"failing tests: {', '.join(s.get('failing_tests') or []) or 'n/a'}\n"
-                         f"output:\n{r.get('output') or ''}")
+                         f"failing tests: {', '.join(s.get('failing_tests') or []) or 'n/a'}")
+            parts.append(f"{header}\n{stats}\noutput:\n{r.get('output') or ''}")
         return "\n\n".join(parts)[:7000]
+
+    @staticmethod
+    def _observed_runs(state: AgentState) -> list[dict]:
+        """What is known about the current code from execution: the user's own runs first, then LocPilot's."""
+        return (state.get("user_runs") or []) + (state.get("last_runs") or [])
 
     def _current_diff(self, state: AgentState) -> str:
         return "".join(p["diff"] for p in self._applied_patches(state))[:7000] or "(no changes applied)"
@@ -1195,8 +1222,8 @@ class LocPilotGraph:
                     "repair_attempts": state.get("repair_attempts", 0) + 1, "test_repair_needed": False,
                     "feedback": None}
         await self.phase(state, "diagnose", "Inspecting the failure")
-        runs = state.get("last_runs") or []
-        user = self._context(state, evidence_lines=30) + "\n\n" + prompts.DIAGNOSE.format(
+        runs = self._observed_runs(state)
+        user = self._context(state, evidence_lines=30, with_user_runs=False) + "\n\n" + prompts.DIAGNOSE.format(
             runs=self._runs_text(runs) + (f"\n\nUser message: {state['request']}" if state.get("intent") == "retry_fix" else ""),
             diff=self._current_diff(state))
         fa, usage = await self.llm_json(state, "diagnose", user, LLMFailureAnalysis, max_tokens=600)
@@ -1226,10 +1253,11 @@ class LocPilotGraph:
         task = ("Explain the changes LocPilot made, why they fix the problem, and how they were verified."
                 if state["intent"] == "explain_changes" else
                 "Review the changes for correctness, possible side effects, edge cases and missing tests.")
-        verification = self._runs_text(state.get("last_runs") or []) if state.get("last_runs") else \
+        observed = self._observed_runs(state)
+        verification = self._runs_text(observed) if observed else \
             "No verification commands have been run for these changes."
         plan = state.get("plan") or {}
-        user = self._context(state, evidence_lines=25) + "\n\n" + prompts.REVIEW.format(
+        user = self._context(state, evidence_lines=25, with_user_runs=False) + "\n\n" + prompts.REVIEW.format(
             request=state["request"], plan=f"{plan.get('summary', '')}\n{plan.get('approach', '')}",
             diff=self._current_diff(state), verification=verification[:3500], task=task)
         review, usage = await self.llm_json(state, "review", user, LLMChangeReview, max_tokens=1400)

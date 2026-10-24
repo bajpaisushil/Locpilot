@@ -1,8 +1,9 @@
-import { FileCode2Icon, FileDiffIcon, InfoIcon, TerminalIcon } from 'lucide-react'
+import { FileCode2Icon, FileDiffIcon, InfoIcon, SquareTerminalIcon, TerminalIcon } from 'lucide-react'
 import { ChangesTab } from '@/components/panels/ChangesTab'
 import { CommandsTab } from '@/components/panels/CommandsTab'
 import { DetailsTab } from '@/components/panels/DetailsTab'
 import { FilesTab } from '@/components/panels/FilesTab'
+import { TerminalTab } from '@/components/panels/TerminalTab'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTask } from '@/lib/queries'
 import { useUi, type RightTab } from '@/store/ui'
@@ -33,6 +34,10 @@ export function RightPanel() {
             Commands
             {commandCount > 0 && <span className="rounded bg-muted-foreground/20 px-1 text-[10px]">{commandCount}</span>}
           </TabsTrigger>
+          <TabsTrigger value="terminal">
+            <SquareTerminalIcon />
+            Terminal
+          </TabsTrigger>
           <TabsTrigger value="details">
             <InfoIcon />
             Details
@@ -47,6 +52,9 @@ export function RightPanel() {
       </TabsContent>
       <TabsContent value="commands" className="min-h-0">
         <CommandsTab />
+      </TabsContent>
+      <TabsContent value="terminal" className="min-h-0">
+        <TerminalTab />
       </TabsContent>
       <TabsContent value="details" className="min-h-0">
         <DetailsTab />

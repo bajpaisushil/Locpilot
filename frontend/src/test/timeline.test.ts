@@ -55,6 +55,19 @@ describe('buildTurns', () => {
     expect(c.kind === 'command' && c.command.exit_code).toBe(0)
   })
 
+  it('keeps the user\'s own runs out of the turn timeline', () => {
+    const cmd = {
+      id: 'c_u', turn: 1, stage: 'user', argv: ['python main.py'], cwd: '/wt', status: 'running' as const,
+      exit_code: null, duration_ms: null, timed_out: false, truncated: false, sandbox: 'seatbelt', summary: null,
+      stdout: null, stderr: null, started_at: '2026-10-24T10:00:00Z', finished_at: null,
+    }
+    const [turn] = buildTurns(taskDetail({ mode: 'code' }), [
+      ev('command_started', { command: cmd }),
+      ev('command_finished', { command: { ...cmd, status: 'completed', exit_code: 1 } }),
+    ])
+    expect(turn.items).toEqual([])
+  })
+
   it('separates turns and flags the newest one as live while running', () => {
     const detail = taskDetail({
       status: 'running',

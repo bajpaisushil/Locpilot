@@ -146,6 +146,23 @@ bitbucket.org) or `git@github.com:<owner>/<repo>.git`. URLs containing credentia
 | GET | `/api/tasks/{task_id}/patch` | `text/x-diff` download of LocPilot's changes |
 | GET | `/api/tasks/{task_id}/commands/{command_id}` | `CommandOut` with full stdout/stderr |
 | POST | `/api/tasks/{task_id}/rollback` | Restores files LocPilot changed (skips files edited by someone else since) → `RollbackResult` |
+| POST | `/api/tasks/{task_id}/commands` | body `{ command, allow_network?: false }` runs **your** command (via `/bin/sh`) in the task worktree, sandboxed → `CommandOut` (202, `stage: "user"`, still running). Output streams as `command_output` events; the finished run is shared with the model on the next message. 400 `no_worktree`, 409 if a turn or another of your commands is running. |
+| POST | `/api/tasks/{task_id}/commands/{command_id}/stop` | Stops your running command (process tree killed, output kept) → `CommandOut` (`status: "cancelled"`). 409 if not running. |
+| GET | `/api/tasks/{task_id}/worktree-changes` | Uncommitted changes in the worktree `{ files: [{ path, status: "A" \| "M" \| "D", locpilot }], suggested_branch, suggested_message, publish }` |
+| POST | `/api/tasks/{task_id}/apply-to-repo` | body `{ files }` writes those changes into your working tree (plain edits; refuses on conflicts: 409 `apply_failed`) → `{ applied, repo_path }` |
+| POST | `/api/tasks/{task_id}/commit` | body `{ branch, message, files }` commits the files to `branch` (created, or advanced from LocPilot's last commit; 409 `commit_failed` otherwise) → `{ commit, branch, files, publish }` |
+| POST | `/api/tasks/{task_id}/push` | Pushes the task's branch to `origin` with your Git credentials → `{ publish }` (409 `push_failed` with a hint) |
+
+### Terminals (POSIX only)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/terminals?repo_id=&task_id=` | `TerminalOut[]` `{ id, title, location: "worktree" \| "repository", cwd, shell, repo_id, task_id, running, exit_code, created_at }` |
+| POST | `/api/terminals` | body `{ repo_id, task_id?, cols?, rows? }` opens your login shell in the task worktree (Code-mode task) or the repository folder → `TerminalOut` (201). 409 `terminal_unavailable` at the limit (`LOCPILOT_MAX_TERMINALS`, 8). |
+| GET | `/api/terminals/{id}/stream` | **SSE**: `reset` `{ data: <scrollback> }` first on every connect, then `output` `{ data }`, then `exit` `{ code }` |
+| POST | `/api/terminals/{id}/input` | body `{ data }` keystrokes / paste (≤ 64 KB) → 204 |
+| POST | `/api/terminals/{id}/resize` | body `{ cols, rows }` → 204 |
+| DELETE | `/api/terminals/{id}` | Hangs up the shell and everything attached to it → `{ ok: true }` |
 
 ```ts
 type Mode = "ask" | "code";

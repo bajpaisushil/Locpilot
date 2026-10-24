@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import time
@@ -7,7 +8,7 @@ import pytest
 
 from locpilot.security.commands import CommandPolicyError, validate_command
 from locpilot.security.paths import PathSecurityError, normalize_relpath, safe_join
-from locpilot.security.sandbox import detect_sandbox, wrap_argv
+from locpilot.security.sandbox import detect_sandbox, seatbelt_profile, wrap_argv
 from locpilot.security.secrets import is_secret_path, redact, scrub_env
 from locpilot.tools.process import run_async, run_sync
 
@@ -129,6 +130,20 @@ async def test_output_is_capped_keeping_head_and_tail(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stop_kills_process_tree_and_keeps_output(tmp_path):
+    script = ("import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+              "print('started', flush=True); time.sleep(60)")
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(1.0, stop.set)
+    start = time.monotonic()
+    result = await run_async([sys.executable, "-c", script], tmp_path, timeout=30, env=dict(os.environ),
+                             max_output_bytes=10_000, stop=stop)
+    assert result.cancelled and not result.timed_out and result.exit_code is None
+    assert "started" in result.stdout
+    assert time.monotonic() - start < 15
+
+
+@pytest.mark.asyncio
 async def test_no_shell_interpolation(tmp_path):
     result = await run_async([sys.executable, "-c", "import sys; print(sys.argv[1])", "$(echo pwned); ls"], tmp_path,
                              timeout=10, env=dict(os.environ), max_output_bytes=10_000)
@@ -160,6 +175,33 @@ async def test_seatbelt_blocks_network_and_outside_writes(tmp_path):
     result = await run_async(argv, ws, timeout=30, env=dict(os.environ), max_output_bytes=10_000)
     assert "outside-denied" in result.stdout and "net-denied" in result.stdout, result.stdout + result.stderr
     assert (ws / "inside.txt").read_text() == "ok"
+    assert not outside.exists()
+
+
+def test_seatbelt_network_opt_in_keeps_file_confinement(tmp_path):
+    ws, scratch, data = tmp_path / "ws", tmp_path / "scratch", tmp_path / "data"
+    closed = seatbelt_profile(ws, scratch, data, allow_localhost=False)
+    opened = seatbelt_profile(ws, scratch, data, allow_localhost=False, allow_network=True)
+    assert "(deny network-outbound (remote ip))" in closed
+    assert "network-outbound" not in opened
+    for profile in (closed, opened):
+        assert "(deny file-write*)" in profile and "(deny file-read*" in profile and "file-read-data" in profile
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt sandbox is macOS-only")
+@pytest.mark.asyncio
+async def test_seatbelt_with_network_still_blocks_outside_writes(tmp_path):
+    ws, scratch, data = tmp_path / "ws", tmp_path / "scratch", tmp_path / "data"
+    for d in (ws, scratch, data):
+        d.mkdir()
+    outside = Path.home() / f".locpilot-sandbox-net-test-{os.getpid()}"
+    code = (f"import pathlib\ntry:\n    pathlib.Path({str(outside)!r}).write_text('bad'); print('OUTSIDE-WRITE')\n"
+            "except OSError: print('outside-denied')\n")
+    argv, kind = wrap_argv([sys.executable, "-c", code], workspace=ws, scratch=scratch, data_dir=data,
+                           allow_network=True)
+    assert kind == "seatbelt"
+    result = await run_async(argv, ws, timeout=30, env=dict(os.environ), max_output_bytes=10_000)
+    assert "outside-denied" in result.stdout, result.stdout + result.stderr
     assert not outside.exists()
 
 
