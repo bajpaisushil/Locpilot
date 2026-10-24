@@ -1988,6 +1988,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "locpilot"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-shell",
+]
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2773,21 +2788,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "locpilot"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "libc",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-shell",
-]
 
 [[package]]
 name = "reqwest"

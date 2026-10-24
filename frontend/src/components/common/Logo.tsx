@@ -1,19 +1,21 @@
 import { cn } from '@/lib/utils'
 
+/** LocPilot mark: the "lp" monogram drawn with strokes on the violet badge. */
 export function Logo({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 64 64" className={cn('size-6', className)} aria-hidden>
       <defs>
-        <linearGradient id="rp-logo" x1="0" y1="0" x2="1" y2="1">
+        <linearGradient id="lp-logo" x1="0" y1="0" x2="1" y2="1">
           <stop offset="0" stopColor="#8b7cff" />
           <stop offset="1" stopColor="#4f46e5" />
         </linearGradient>
       </defs>
-      <rect width="64" height="64" rx="14" fill="url(#rp-logo)" />
-      <path
-        d="M20 46V18h13.5c6.2 0 10.5 3.7 10.5 9.3 0 4.3-2.5 7.4-6.5 8.6L45 46h-7.6l-6.6-9.6H27V46z M27 30.7h6.1c2.7 0 4.4-1.4 4.4-3.5s-1.7-3.5-4.4-3.5H27z"
-        fill="#fff"
-      />
+      <rect width="64" height="64" rx="14" fill="url(#lp-logo)" />
+      <g fill="none" stroke="#fff" strokeWidth={5.5} strokeLinecap="round">
+        <path d="M18 12.5V43" />
+        <path d="M29 26V51.5" />
+        <circle cx="37.5" cy="34.5" r="8.5" />
+      </g>
     </svg>
   )
 }
