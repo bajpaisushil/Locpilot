@@ -235,7 +235,13 @@ def markdown(results: list[dict], meta: dict) -> str:
                                                   for k in keys)]
     lines += ["", "Caveats: these are tiny synthetic fixtures with known answers. Passing them does not demonstrate "
               "production-grade autonomous coding; results vary run to run with local model sampling, hardware and "
-              "model choice.", ""]
+              "model choice.", "",
+              "Disclosure: the root-cause prompt includes a generic checklist of common bug patterns, and these "
+              "fixtures exercise common bug classes that the checklist also names (state reset in a loop, "
+              "off-by-one, missing keys, arithmetic scale). The 'root cause (concept)' keyword lists were extended "
+              "after the first run to include canonical phrasings such as 'off-by-one' and 'KeyError'. "
+              "'Root cause (location)' is computed from the lines the reference fix changes. Hidden acceptance tests "
+              "and the regression re-run are independent of the agent's own claims.", ""]
     for r in results:
         a = r.get("agent") or {}
         if a:

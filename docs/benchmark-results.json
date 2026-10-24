@@ -1,0 +1,172 @@
+{
+  "meta": {
+    "date": "2026-10-24 15:20 UTC",
+    "model": "qwen2.5-coder:7b",
+    "machine": "Apple M4, 16 GB RAM, macOS 26.5"
+  },
+  "results": [
+    {
+      "fixture": "cart-discount",
+      "fixture_check": {
+        "acceptance_fails_on_original": true,
+        "acceptance_passes_with_reference_fix": true,
+        "existing_tests_pass_on_original": true,
+        "valid": true
+      },
+      "agent": {
+        "status": "changes_verified",
+        "headline": "Verified by execution: LocPilot's regression test failed before the change and passes after it (4 tests passed). Review the test \u2014 it encodes LocPilot's reading of the expected behavior.",
+        "relevant_files": true,
+        "root_cause_location": true,
+        "root_cause_keywords": true,
+        "root_cause_text": "The discount calculation in `applyDiscount` is incorrect. The discount should be applied as a percentage, not as a full amount.",
+        "patch_accepted": true,
+        "regression_test_detects_bug": true,
+        "existing_tests_pass": true,
+        "agent_claimed_regression": "detected_bug",
+        "within_limits": true,
+        "llm_calls": 7,
+        "retries": 0,
+        "approvals": 1,
+        "duration_s": 365.5,
+        "intent": "fix",
+        "root_cause_citations": [
+          "src/discounts.js:16-16"
+        ],
+        "known_bug_lines": {
+          "src/discounts.js": [
+            16
+          ]
+        },
+        "diff": "diff --git a/src/discounts.js b/src/discounts.js\n--- a/src/discounts.js\n+++ b/src/discounts.js\n@@ -13,7 +13,7 @@\n \n /** Apply a percentage discount to an amount. */\n function applyDiscount(amount, percent) {\n-  const discount = amount * (percent / 10);\n+  const discount = amount * (percent / 100);\n   return Math.max(amount - discount, 0);\n }\n \ndiff --git a/test/discounts.regression.test.js b/test/discounts.regression.test.js\nnew file mode 100644\n--- /dev/null\n+++ b/test/discounts.regression.test.js\n@@ -0,0 +1,9 @@\n+'use strict';\n+\n+const test = require('node:test');\n+const assert = require('node:assert/strict');\n+const { applyDiscount } = require('../src/discounts');\n+\n+test('applying a 10% discount code to a $200 cart', () => {\n+  assert.equal(applyDiscount(200, 10), 180);\n+});\n",
+        "unresolved": [],
+        "agent_tests": [
+          "test/discounts.regression.test.js"
+        ]
+      }
+    },
+    {
+      "fixture": "hotel-offers",
+      "fixture_check": {
+        "acceptance_fails_on_original": true,
+        "acceptance_passes_with_reference_fix": true,
+        "existing_tests_pass_on_original": true,
+        "valid": true
+      },
+      "agent": {
+        "status": "changes_verified",
+        "headline": "Verified by execution: LocPilot's regression test failed before the change and passes after it (4 tests passed). Review the test \u2014 it encodes LocPilot's reading of the expected behavior.",
+        "relevant_files": true,
+        "root_cause_location": false,
+        "root_cause_keywords": false,
+        "root_cause_text": "The dedupe_key method is not correctly identifying duplicate offers.",
+        "patch_accepted": false,
+        "regression_test_detects_bug": true,
+        "existing_tests_pass": true,
+        "agent_claimed_regression": "detected_bug",
+        "within_limits": true,
+        "llm_calls": 7,
+        "retries": 0,
+        "approvals": 1,
+        "duration_s": 159.9,
+        "intent": "fix",
+        "root_cause_citations": [
+          "offers/models.py:6-17"
+        ],
+        "known_bug_lines": {
+          "offers/aggregator.py": [
+            12,
+            14,
+            19,
+            20
+          ]
+        },
+        "diff": "diff --git a/offers/models.py b/offers/models.py\n--- a/offers/models.py\n+++ b/offers/models.py\n@@ -12,6 +12,6 @@\n     price: float\n     currency: str = \"EUR\"\n \n-    def dedupe_key(self) -> tuple[str, str, str]:\n-        \"\"\"Two offers for the same hotel, room type and rate plan are the same product.\"\"\"\n-        return (self.hotel_id, self.room_type, self.rate_plan)\n+    def dedupe_key(self) -> tuple[str, str, str, str]:\n+        \"\"\"Two offers for the same hotel, room type, rate plan and supplier are the same product.\"\"\"\n+        return (self.hotel_id, self.room_type, self.rate_plan, self.supplier)\ndiff --git a/tests/test_models_regression.py b/tests/test_models_regression.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_models_regression.py\n@@ -0,0 +1,9 @@\n+import unittest\n+\n+from offers.models import Offer\n+\n+\n+class DedupeKeyTest(unittest.TestCase):\n+    def test_dedupe_key_includes_supplier(self):\n+        offer = Offer(\"H1\", \"double room\", \"standard\", \"SupplierA\", 100.0)\n+        self.assertEqual(offer.dedupe_key(), ('H1', 'double room', 'standard', 'SupplierA'))\n",
+        "unresolved": [],
+        "agent_tests": [
+          "tests/test_models_regression.py"
+        ]
+      }
+    },
+    {
+      "fixture": "pagination",
+      "fixture_check": {
+        "acceptance_fails_on_original": true,
+        "acceptance_passes_with_reference_fix": true,
+        "existing_tests_pass_on_original": true,
+        "valid": true
+      },
+      "agent": {
+        "status": "changes_verified",
+        "headline": "Verified by execution: LocPilot's regression test failed before the change and passes after it (3 tests passed). Review the test \u2014 it encodes LocPilot's reading of the expected behavior.",
+        "relevant_files": true,
+        "root_cause_location": true,
+        "root_cause_keywords": true,
+        "root_cause_text": "Off-by-one error in start index calculation",
+        "patch_accepted": true,
+        "regression_test_detects_bug": true,
+        "existing_tests_pass": true,
+        "agent_claimed_regression": "detected_bug",
+        "within_limits": true,
+        "llm_calls": 8,
+        "retries": 0,
+        "approvals": 1,
+        "duration_s": 171.4,
+        "intent": "fix",
+        "root_cause_citations": [
+          "catalog/pagination.py:19-19"
+        ],
+        "known_bug_lines": {
+          "catalog/pagination.py": [
+            19
+          ]
+        },
+        "diff": "diff --git a/catalog/pagination.py b/catalog/pagination.py\n--- a/catalog/pagination.py\n+++ b/catalog/pagination.py\n@@ -16,7 +16,7 @@\n     \"\"\"Return one page of ``items``. Pages are 1-based: page=1 is the first page.\"\"\"\n     size = clamp_per_page(per_page)\n     page = max(page, 1)\n-    start = page * size\n+    start = (page - 1) * size\n     end = start + size\n     total_pages = (len(items) + size - 1) // size\n     return {\ndiff --git a/tests/test_pagination_regression.py b/tests/test_pagination_regression.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_pagination_regression.py\n@@ -0,0 +1,18 @@\n+import unittest\n+from catalog.pagination import paginate\n+\n+class PaginationRegressionTest(unittest.TestCase):\n+    def test_first_page_correct_behavior(self):\n+        items = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]\n+        page = 1\n+        per_page = 10\n+        expected_correct_behavior = {\n+            \"items\": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],\n+            \"page\": 1,\n+            \"per_page\": 10,\n+            \"total\": 15,\n+            \"total_pages\": 2,\n+            \"has_next\": True\n+        }\n+        result = paginate(items, page, per_page)\n+        assert result == expected_correct_behavior\n",
+        "unresolved": [],
+        "agent_tests": [
+          "tests/test_pagination_regression.py"
+        ]
+      }
+    },
+    {
+      "fixture": "user-profile-500",
+      "fixture_check": {
+        "acceptance_fails_on_original": true,
+        "acceptance_passes_with_reference_fix": true,
+        "existing_tests_pass_on_original": true,
+        "valid": true
+      },
+      "agent": {
+        "status": "changes_verified",
+        "headline": "Verified by execution: LocPilot's regression test failed before the change and passes after it (3 tests passed). Review the test \u2014 it encodes LocPilot's reading of the expected behavior.",
+        "relevant_files": true,
+        "root_cause_location": false,
+        "root_cause_keywords": true,
+        "root_cause_text": "The address dictionary is None for user 3, causing a KeyError when trying to access its 'city' and 'country' keys.",
+        "patch_accepted": false,
+        "regression_test_detects_bug": true,
+        "existing_tests_pass": true,
+        "agent_claimed_regression": "detected_bug",
+        "within_limits": true,
+        "llm_calls": 7,
+        "retries": 0,
+        "approvals": 1,
+        "duration_s": 159.4,
+        "intent": "fix",
+        "root_cause_citations": [
+          "api/db.py:14-14"
+        ],
+        "known_bug_lines": {
+          "api/serializers.py": [
+            13
+          ]
+        },
+        "diff": "diff --git a/api/serializers.py b/api/serializers.py\n--- a/api/serializers.py\n+++ b/api/serializers.py\n@@ -6,9 +6,17 @@\n \n \n def serialize_profile(user: dict) -> dict:\n+    address = user.get(\"address\")\n+    if address is None:\n+        return {\n+            \"id\": user[\"id\"],\n+            \"name\": user[\"name\"],\n+            \"email\": user[\"email\"],\n+            \"location\": {\"city\": None, \"country\": None},\n+        }\n     return {\n         \"id\": user[\"id\"],\n         \"name\": user[\"name\"],\n         \"email\": user[\"email\"],\n-        \"location\": serialize_address(user[\"address\"]),\n+        \"location\": serialize_address(address),\n     }\ndiff --git a/tests/test_serializers_regression.py b/tests/test_serializers_regression.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_serializers_regression.py\n@@ -0,0 +1,8 @@\n+import unittest\n+from api.serializers import serialize_profile\n+\n+class SerializerTest(unittest.TestCase):\n+    def test_profile_for_user_with_no_address(self):\n+        user = {'id': 3, 'name': 'John Doe', 'email': 'john@example.com', 'address': None}\n+        expected = {'id': 3, 'name': 'John Doe', 'email': 'john@example.com', 'location': {'city': None, 'country': None}}\n+        self.assertEqual(serialize_profile(user), expected)\n",
+        "unresolved": [],
+        "agent_tests": [
+          "tests/test_serializers_regression.py"
+        ]
+      }
+    }
+  ]
+}

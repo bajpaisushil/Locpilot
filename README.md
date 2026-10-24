@@ -163,10 +163,34 @@ docs/               architecture, API contract, security, desktop packaging, tro
 * [Troubleshooting](docs/troubleshooting.md)
 * [Benchmark results](docs/benchmark-results.md)
 
-## Limitations
+## Status and known limitations
 
-See the *Status* section of the project report and [docs/security.md](docs/security.md):
-small local models make mistakes (LocPilot reports them rather than hiding them); the test
-sandbox is macOS Seatbelt / Linux bubblewrap only; Windows/Linux installers are built by CI
-but were not tested by hand; semantic (embedding) retrieval is not implemented — retrieval is
-lexical + symbol-based.
+Verified on an Apple M4 (16 GB, macOS 26) with `qwen2.5-coder:7b`:
+
+* Desktop app (`LocPilot.app` / `.dmg`) builds, starts its bundled backend with a per-launch token,
+  and shuts it down with the window; browser dev mode via `scripts/dev.sh`.
+* Connecting a public GitHub repository and a local checkout; Ask-mode explanations/RCA with
+  validated citations; Code-mode patch → approval → regression test fails before / passes after
+  the fix → full test run in the macOS sandbox; bounded repair; rollback; `.patch` download;
+  restart recovery and resume.
+* Automated checks: `scripts/test.sh` (84 backend tests, 45 frontend tests, fixture validity).
+
+Known limitations — stated plainly:
+
+* **Model quality.** A 7B local model makes mistakes: wrong root causes, fixes in the wrong place,
+  or regression tests that encode the wrong expectation. LocPilot surfaces these instead of
+  hiding them (unverified/failed statuses, removed citations), but "verified" only means
+  *LocPilot's own regression test failed before the change and passes after it* — review the
+  test. See the measured [benchmark results](docs/benchmark-results.md); larger models do better.
+* **Speed.** Expect 1–4 min per Ask-mode investigation and 3–8 min per Code-mode fix on a laptop.
+* **Sandbox.** macOS Seatbelt and Linux bubblewrap only; Windows runs approved commands
+  unsandboxed. A Git worktree is not a security boundary. See [docs/security.md](docs/security.md).
+* **Platforms.** Windows and Linux installers are produced by the release workflow but were not
+  tested by hand; installers are unsigned unless you add signing secrets (see
+  [docs/desktop.md](docs/desktop.md)).
+* **Retrieval** is lexical + symbol/call-graph based; there is no embedding (semantic) index.
+* **Languages.** Symbol extraction: Python (ast), JS/TS, Go, Java, Rust (Tree-sitter), regex
+  fallback for others. Test-runner detection covers Python, Node, Go, Rust, Maven/Gradle, Make.
+* **Tests run with your environment.** LocPilot never installs dependencies; projects whose tests
+  need services, network or uninstalled packages will fail verification (reported as an
+  environment problem, not "fixed" with code).
