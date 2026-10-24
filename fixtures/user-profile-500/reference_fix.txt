@@ -1,0 +1,6 @@
+api/serializers.py
+<<<<<<< SEARCH
+        "location": serialize_address(user["address"]),
+=======
+        "location": serialize_address(user["address"]) if user.get("address") else None,
+>>>>>>> REPLACE

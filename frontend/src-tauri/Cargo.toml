@@ -1,0 +1,30 @@
+[package]
+name = "locpilot"
+version = "0.1.0"
+description = "LocPilot desktop shell"
+authors = ["bajpaisushil"]
+license = ""
+repository = ""
+edition = "2024"
+rust-version = "1.90"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "locpilot_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "2.12.5", features = [] }
+tauri-plugin-shell = "2.5.0"
+tauri-plugin-dialog = "2.8.3"
+tauri-plugin-opener = "2.7.2"
+getrandom = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

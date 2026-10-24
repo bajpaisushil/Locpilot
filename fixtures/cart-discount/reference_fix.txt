@@ -1,0 +1,6 @@
+src/discounts.js
+<<<<<<< SEARCH
+  const discount = amount * (percent / 10);
+=======
+  const discount = amount * (percent / 100);
+>>>>>>> REPLACE

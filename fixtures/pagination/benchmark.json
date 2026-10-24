@@ -1,0 +1,44 @@
+{
+  "id": "pagination",
+  "language": "python",
+  "prompt": "GET /items skips the first page of results: page=1 returns products 11-20 instead of 1-10. Investigate the root cause and fix it with the smallest possible change, adding a regression test.",
+  "expected_files": [
+    "catalog/pagination.py"
+  ],
+  "root_cause": {
+    "file": "catalog/pagination.py",
+    "keywords": [
+      "page - 1",
+      "page-1",
+      "start",
+      "1-based",
+      "zero-based",
+      "offset",
+      "page * size",
+      "off-by-one",
+      "off by one",
+      "skip",
+      "first page"
+    ]
+  },
+  "acceptance_command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "acceptance",
+    "-t",
+    "."
+  ],
+  "existing_test_command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-t",
+    "."
+  ]
+}

@@ -1,0 +1,20 @@
+offers/aggregator.py
+<<<<<<< SEARCH
+    merged: list[Offer] = []
+    for supplier, offers in supplier_results.items():
+        best: dict[tuple[str, str, str], Offer] = {}
+        for offer in offers:
+            key = offer.dedupe_key()
+            if key not in best or offer.price < best[key].price:
+                best[key] = offer
+        merged.extend(best.values())
+    return sort_offers(merged)
+=======
+    best: dict[tuple[str, str, str], Offer] = {}
+    for supplier, offers in supplier_results.items():
+        for offer in offers:
+            key = offer.dedupe_key()
+            if key not in best or offer.price < best[key].price:
+                best[key] = offer
+    return sort_offers(list(best.values()))
+>>>>>>> REPLACE

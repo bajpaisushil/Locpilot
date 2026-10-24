@@ -1,0 +1,40 @@
+{
+  "id": "hotel-offers",
+  "language": "python",
+  "prompt": "Users see duplicate hotel offers in search results when the same room is offered by more than one supplier (for example hotel H1 double room appears twice). Find the root cause and fix it with the smallest possible change, and add a regression test.",
+  "expected_files": [
+    "offers/aggregator.py"
+  ],
+  "root_cause": {
+    "file": "offers/aggregator.py",
+    "keywords": [
+      "best",
+      "loop",
+      "supplier",
+      "inside",
+      "reset",
+      "per supplier",
+      "each supplier"
+    ]
+  },
+  "acceptance_command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "acceptance",
+    "-t",
+    "."
+  ],
+  "existing_test_command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-t",
+    "."
+  ]
+}

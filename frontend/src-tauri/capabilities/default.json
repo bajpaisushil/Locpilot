@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "LocPilot main window. The webview gets no shell or filesystem permissions: the backend sidecar is started from Rust, and files are only read/written by the backend after its own validation.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://ollama.com/*" },
+        { "url": "https://github.com/*" },
+        { "url": "https://docs.github.com/*" },
+        { "url": "https://git-scm.com/*" },
+        { "url": "https://developer.apple.com/*" },
+        { "url": "https://learn.microsoft.com/*" }
+      ]
+    }
+  ]
+}

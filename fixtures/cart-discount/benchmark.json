@@ -1,0 +1,30 @@
+{
+  "id": "cart-discount",
+  "language": "javascript",
+  "prompt": "Checkout shows the wrong total when a discount code is applied: a 10% discount (WELCOME10) on a $200 cart gives $0 instead of $180. Find the root cause and fix it with the smallest possible change, with a regression test.",
+  "expected_files": [
+    "src/discounts.js"
+  ],
+  "root_cause": {
+    "file": "src/discounts.js",
+    "keywords": [
+      "/ 10",
+      "100",
+      "percent",
+      "percentage",
+      "divid",
+      "10 instead of 100",
+      "divided by 10",
+      "factor of 10"
+    ]
+  },
+  "acceptance_command": [
+    "node",
+    "--test",
+    "acceptance/*.test.js"
+  ],
+  "existing_test_command": [
+    "node",
+    "--test"
+  ]
+}

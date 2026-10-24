@@ -1,0 +1,171 @@
+# Builds LocPilot desktop installers on each OS and attaches them to a DRAFT GitHub Release.
+# Nothing is published automatically: a maintainer reviews the draft and publishes it.
+#
+# Trigger: push a tag like v0.1.0, or run manually (Actions → Release desktop app → Run workflow).
+# Ollama and models are NOT bundled; users install them separately (first-run setup screen).
+#
+# Optional signing (unsigned builds work without any secrets):
+#   macOS:   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#            and for notarization APPLE_ID, APPLE_PASSWORD (app-specific password), APPLE_TEAM_ID
+#   Windows: WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
+name: Release desktop app
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-14
+            target: aarch64-apple-darwin
+          - name: macOS (Intel)
+            # GitHub's x86_64 macOS runner label. If GitHub retires it, switch to the
+            # current Intel label (see "GitHub-hosted runners" docs) or drop this entry.
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: Windows (x64)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: Linux (x64)
+            # Build on the oldest supported Ubuntu: the PyInstaller sidecar and AppImage
+            # require at least this glibc on users' machines.
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies (WebKitGTK, AppIndicator)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri -> target
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend dependencies
+        run: uv sync --project backend --frozen --python 3.12
+
+      # PyInstaller cannot cross-compile: each runner builds the sidecar for its own OS/arch.
+      - name: Build backend sidecar (+ smoke test)
+        run: python scripts/build_sidecar.py --target ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend checks
+        working-directory: frontend
+        run: |
+          npm run typecheck
+          npm run lint
+          npm test
+
+      - name: Enable macOS signing (only when secrets are configured)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Tauri treats a *set but empty* variable as "sign with this", so only export real values.
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            {
+              echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+              echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            } >> "$GITHUB_ENV"
+            echo "macOS code signing enabled"
+          else
+            echo "No APPLE_CERTIFICATE secret: building an unsigned (ad-hoc signed) app"
+          fi
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            {
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+            echo "Notarization enabled"
+          fi
+
+      - name: Enable Windows signing (only when secrets are configured)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) {
+            Write-Host "No WINDOWS_CERTIFICATE secret: building unsigned installers"
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx
+          # Tauri merges tauri.windows.conf.json into tauri.conf.json for Windows builds.
+          $config = @{ bundle = @{ windows = @{ certificateThumbprint = $cert.Thumbprint; digestAlgorithm = "sha256"; timestampUrl = "http://timestamp.digicert.com" } } } | ConvertTo-Json -Depth 5
+          Set-Content -Path frontend/src-tauri/tauri.windows.conf.json -Value $config -Encoding utf8
+          Write-Host "Windows code signing enabled (thumbprint $($cert.Thumbprint))"
+
+      - name: Build installers and upload to a draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: frontend
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: LocPilot ${{ github.event.inputs.tag || github.ref_name }}
+          releaseBody: |
+            Local-first AI software engineering agent (Tauri desktop app with a bundled Python agent).
+
+            **Before first launch:** install [Ollama](https://ollama.com/download) and pull a model
+            (default `qwen2.5-coder:7b`). LocPilot guides you through this on first run and works
+            offline afterwards. LocPilot never falls back to cloud AI APIs.
+
+            Unsigned builds: see docs/desktop.md for Gatekeeper / SmartScreen instructions.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}

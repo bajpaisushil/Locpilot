@@ -1,0 +1,226 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-panel: var(--panel);
+  --color-code: var(--code);
+  --color-diff-add: var(--diff-add);
+  --color-diff-add-strong: var(--diff-add-strong);
+  --color-diff-del: var(--diff-del);
+  --color-diff-del-strong: var(--diff-del-strong);
+  --color-diff-hunk: var(--diff-hunk);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.5rem;
+  --background: oklch(0.99 0.002 270);
+  --foreground: oklch(0.21 0.012 270);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.012 270);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.012 270);
+  --primary: oklch(0.53 0.2 277);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.955 0.005 270);
+  --secondary-foreground: oklch(0.25 0.012 270);
+  --muted: oklch(0.96 0.004 270);
+  --muted-foreground: oklch(0.5 0.015 270);
+  --accent: oklch(0.95 0.012 277);
+  --accent-foreground: oklch(0.25 0.03 277);
+  --destructive: oklch(0.57 0.21 25);
+  --destructive-foreground: oklch(0.99 0 0);
+  --success: oklch(0.57 0.14 155);
+  --warning: oklch(0.65 0.15 70);
+  --info: oklch(0.56 0.14 240);
+  --border: oklch(0.21 0.012 270 / 0.11);
+  --input: oklch(0.21 0.012 270 / 0.16);
+  --ring: oklch(0.53 0.2 277 / 0.55);
+  --sidebar: oklch(0.972 0.004 270);
+  --panel: oklch(0.982 0.003 270);
+  --code: oklch(0.975 0.004 270);
+  --diff-add: oklch(0.6 0.15 150 / 0.12);
+  --diff-add-strong: oklch(0.45 0.14 150);
+  --diff-del: oklch(0.6 0.2 25 / 0.11);
+  --diff-del-strong: oklch(0.5 0.19 25);
+  --diff-hunk: oklch(0.53 0.2 277 / 0.08);
+}
+
+.dark {
+  --background: oklch(0.163 0.005 275);
+  --foreground: oklch(0.94 0.004 270);
+  --card: oklch(0.196 0.006 275);
+  --card-foreground: oklch(0.94 0.004 270);
+  --popover: oklch(0.205 0.007 275);
+  --popover-foreground: oklch(0.94 0.004 270);
+  --primary: oklch(0.67 0.17 278);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.245 0.007 275);
+  --secondary-foreground: oklch(0.92 0.004 270);
+  --muted: oklch(0.235 0.006 275);
+  --muted-foreground: oklch(0.68 0.012 270);
+  --accent: oklch(0.27 0.02 278);
+  --accent-foreground: oklch(0.95 0.01 278);
+  --destructive: oklch(0.65 0.2 24);
+  --destructive-foreground: oklch(0.99 0 0);
+  --success: oklch(0.74 0.15 155);
+  --warning: oklch(0.81 0.14 78);
+  --info: oklch(0.73 0.12 238);
+  --border: oklch(1 0 0 / 0.085);
+  --input: oklch(1 0 0 / 0.13);
+  --ring: oklch(0.67 0.17 278 / 0.6);
+  --sidebar: oklch(0.143 0.005 275);
+  --panel: oklch(0.178 0.005 275);
+  --code: oklch(0.145 0.005 275);
+  --diff-add: oklch(0.7 0.15 150 / 0.13);
+  --diff-add-strong: oklch(0.78 0.15 150);
+  --diff-del: oklch(0.65 0.2 25 / 0.14);
+  --diff-del-strong: oklch(0.75 0.16 25);
+  --diff-hunk: oklch(0.67 0.17 278 / 0.1);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+    overscroll-behavior: none;
+  }
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 35%, transparent);
+  }
+  /* Thin, unobtrusive scrollbars that match the theme. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklch, var(--foreground) 18%, transparent) transparent;
+  }
+}
+
+@layer components {
+  .prose-rp {
+    @apply text-sm leading-relaxed text-foreground;
+  }
+  .prose-rp > * + * {
+    @apply mt-3;
+  }
+  .prose-rp h1,
+  .prose-rp h2,
+  .prose-rp h3,
+  .prose-rp h4 {
+    @apply font-semibold tracking-tight text-foreground;
+  }
+  .prose-rp h1 {
+    @apply text-lg;
+  }
+  .prose-rp h2 {
+    @apply text-base;
+  }
+  .prose-rp h3,
+  .prose-rp h4 {
+    @apply text-sm;
+  }
+  .prose-rp ul {
+    @apply list-disc space-y-1 pl-5;
+  }
+  .prose-rp ol {
+    @apply list-decimal space-y-1 pl-5;
+  }
+  .prose-rp a {
+    @apply text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary;
+  }
+  .prose-rp code {
+    @apply rounded bg-muted px-1 py-0.5 font-mono text-[0.85em];
+  }
+  .prose-rp pre {
+    @apply overflow-x-auto rounded-md border bg-code p-3 font-mono text-xs leading-relaxed;
+  }
+  .prose-rp pre code {
+    @apply bg-transparent p-0 text-[inherit];
+  }
+  .prose-rp blockquote {
+    @apply border-l-2 border-primary/40 pl-3 text-muted-foreground;
+  }
+  .prose-rp table {
+    @apply w-full border-collapse text-xs;
+  }
+  .prose-rp th,
+  .prose-rp td {
+    @apply border px-2 py-1 text-left;
+  }
+  .prose-rp hr {
+    @apply border-border;
+  }
+}
+
+/* Monaco citation highlight. */
+.rp-cite-line {
+  background: color-mix(in oklch, var(--primary) 16%, transparent);
+}
+.rp-cite-gutter {
+  background: var(--primary);
+  width: 3px !important;
+  margin-left: 3px;
+}
+
+@keyframes rp-pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.rp-pulse {
+  animation: rp-pulse-dot 1.4s ease-in-out infinite;
+}
+
+@keyframes rp-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}

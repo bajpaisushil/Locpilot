@@ -1,0 +1,38 @@
+{
+  "id": "user-profile-500",
+  "language": "python",
+  "prompt": "GET /users/3/profile returns a 500 error, while other users' profiles work. Investigate why this API returns a 500 error and fix it so users without an address get a profile with location set to null. Add a regression test.",
+  "expected_files": [
+    "api/serializers.py"
+  ],
+  "root_cause": {
+    "file": "api/serializers.py",
+    "keywords": [
+      "address",
+      "KeyError",
+      "missing",
+      "no address",
+      "without an address"
+    ]
+  },
+  "acceptance_command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "acceptance",
+    "-t",
+    "."
+  ],
+  "existing_test_command": [
+    "python3",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-t",
+    "."
+  ]
+}

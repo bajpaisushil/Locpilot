@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+backend/build/
+backend/dist/
+*.spec.bak
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/test-results/
+frontend/playwright-report/
+
+# Tauri / Rust
+frontend/src-tauri/target/
+frontend/src-tauri/gen/schemas/
+frontend/src-tauri/binaries/locpilot-backend-*
+
+# Local data and secrets
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.locpilot/
