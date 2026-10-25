@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     user_command_timeout_s: int = 900
     terminal_shell: str | None = None  # default: the user's login shell
     max_terminals: int = 8
+    lock_wait_s: float = 10.0  # how long a starting backend waits for a previous one on the same data dir to exit
     terminal_scrollback_chars: int = 400_000
     max_output_bytes: int = 200_000
     sandbox: Literal["auto", "off"] = "auto"

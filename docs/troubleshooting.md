@@ -41,6 +41,10 @@
 * macOS Gatekeeper may block an unsigned build: right-click the app → Open, or
   `xattr -dr com.apple.quarantine /Applications/LocPilot.app` for a build you made
   yourself. See [desktop.md](desktop.md).
+* "Another LocPilot backend is already using …": only one backend may use a data
+  directory at a time (two would run the same tasks). Close the other LocPilot window, or
+  stop the other backend (for example `scripts/dev.sh` uses `~/.locpilot` too). A restarting
+  backend waits up to `LOCPILOT_LOCK_WAIT_S` (10 s) for the previous one to exit.
 
 ## "Git is not installed"
 

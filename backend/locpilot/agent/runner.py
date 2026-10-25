@@ -153,6 +153,8 @@ class TaskManager:
         return rows[-limit:]
 
     def _launch(self, task_id: str, turn: int, graph_input: Any) -> None:
+        if self.is_running(task_id):
+            raise TaskConflictError("A turn is already running for this task.")
         self._running[task_id] = asyncio.create_task(self._run(task_id, turn, graph_input), name=f"task:{task_id}")
 
     async def _run(self, task_id: str, turn: int, graph_input: Any) -> None:
@@ -224,6 +226,8 @@ class TaskManager:
                 raise KeyError(task_id)
             if task["status"] != "interrupted":
                 raise TaskConflictError("Only interrupted tasks can be resumed.")
+            if self.is_running(task_id):
+                raise TaskConflictError("This task is already running.")
             self._ensure_no_user_command(task_id)
             snapshot = await self.graph.aget_state(self.thread_config(task_id, task["turn"]))
             if snapshot.interrupts:
@@ -237,6 +241,14 @@ class TaskManager:
             await self.emit(task_id, task["turn"], "log", {"level": "info",
                                                            "text": f"Resuming from checkpoint at: {', '.join(snapshot.next)}"})
             self._launch(task_id, task["turn"], None)
+
+    async def forget(self, task_id: str, turns: int) -> None:
+        """Delete a task's LangGraph checkpoints (one thread per turn)."""
+        saver = self.graph.checkpointer if self.graph is not None else None
+        if saver is None:
+            return
+        for turn in range(1, turns + 1):
+            await saver.adelete_thread(f"{task_id}#{turn}")
 
     async def decide(self, task_id: str, approval_id: str, decision: dict) -> None:
         async with self._locks[task_id]:

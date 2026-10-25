@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Header, Request
@@ -110,6 +111,10 @@ async def delete_task(task_id: str, request: Request) -> dict:
         except git.GitError:
             pass
         drop_index(Path(task["worktree_path"]))
+    await manager.forget(task_id, task["turn"])  # LangGraph checkpoints for every turn of this task
+    scratch = settings.scratch_dir / task_id
+    if scratch.is_dir() and scratch.resolve().is_relative_to(settings.scratch_dir.resolve()):
+        await asyncio.to_thread(shutil.rmtree, scratch, True)
     db.delete_task(task_id)
     return {"ok": True}
 

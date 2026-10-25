@@ -97,6 +97,44 @@ def _watch_parent(parent_pid: int, server: uvicorn.Server) -> None:
             os._exit(0)
 
 
+_LOCK_HANDLE = None
+
+
+def acquire_data_dir_lock(data_dir: Path, wait_s: float = 0.0) -> bool:
+    """Hold an exclusive OS lock on the data directory for the life of this process.
+
+    Two backends sharing one data directory would both work on the same tasks
+    (and each would mark the other's running tasks as interrupted). Waits up to
+    ``wait_s`` for a previous backend that is still shutting down (an app restart).
+    """
+    global _LOCK_HANDLE
+    handle = open(data_dir / "backend.lock", "a+")  # noqa: SIM115 - must stay open while the process runs
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            if sys.platform.startswith("win"):
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                return False
+            time.sleep(0.2)
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _LOCK_HANDLE = handle
+    return True
+
+
 def configure_logging(settings: Settings, level: str) -> None:
     settings.logs_dir.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
@@ -134,6 +172,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.fix_path or getattr(sys, "frozen", False):
         fix_path()
     settings.ensure_dirs()
+    if not acquire_data_dir_lock(settings.data_dir, wait_s=settings.lock_wait_s):
+        print(f"Another LocPilot backend is already using {settings.data_dir}. Close the other LocPilot window "
+              "(or stop the other backend) and try again.", file=sys.stderr)
+        sys.exit(4)
     configure_logging(settings, args.log_level)
 
     family = socket.AF_INET6 if ":" in settings.host else socket.AF_INET
