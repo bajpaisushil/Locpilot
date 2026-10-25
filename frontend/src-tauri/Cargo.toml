@@ -1,6 +1,6 @@
 [package]
 name = "locpilot"
-version = "0.1.0"
+version = "0.2.0"
 description = "LocPilot desktop shell"
 authors = ["bajpaisushil"]
 license = ""

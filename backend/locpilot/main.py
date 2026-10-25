@@ -197,6 +197,10 @@ def main(argv: list[str] | None = None) -> None:
     server = uvicorn.Server(config)
     if args.parent_pid:
         threading.Thread(target=_watch_parent, args=(args.parent_pid, server), daemon=True).start()
+    if getattr(sys, "frozen", False):
+        # A onefile build runs as a launcher process plus this one. If the launcher is force-killed
+        # (an app restart that timed out), exit too: an orphan would keep the data directory locked.
+        threading.Thread(target=_watch_parent, args=(os.getppid(), server), daemon=True).start()
 
     async def run() -> None:
         serve = asyncio.create_task(server.serve(sockets=[sock]))

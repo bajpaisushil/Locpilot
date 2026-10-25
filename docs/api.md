@@ -28,7 +28,7 @@ locpilot-backend [--host 127.0.0.1] [--port 0] [--data-dir DIR] [--parent-pid PI
 When the server is listening, it prints exactly one line to **stdout**:
 
 ```
-LOCPILOT_READY {"port": 51234, "pid": 4242, "version": "0.1.0"}
+LOCPILOT_READY {"port": 51234, "pid": 4242, "version": "0.2.0"}
 ```
 
 All other logging goes to stderr and `<data-dir>/logs/backend.log`.
@@ -55,7 +55,7 @@ to browser JS). In Tauri, the UI calls the Tauri command `backend_info` to get
 
 | Method | Path | Response |
 |---|---|---|
-| GET | `/api/health` | `{ "status": "ok", "version": "0.1.0" }` (no auth required) |
+| GET | `/api/health` | `{ "status": "ok", "version": "0.2.0" }` (no auth required) |
 | GET | `/api/setup/status` | `SetupStatus` |
 | POST | `/api/setup/pull-model` | body `{ "model": "qwen2.5-coder:7b" }` (optional, defaults to configured) → `PullStatus` |
 | GET | `/api/setup/pull-status` | `PullStatus` |

@@ -110,10 +110,41 @@ def build(triple: str) -> Path:
     return target
 
 
+def stop_tree(proc: subprocess.Popen) -> None:
+    """Stop the sidecar and everything it started: a onefile binary is a launcher plus the real backend."""
+    if sys.platform.startswith("win"):
+        # terminate() would only kill the launcher; the backend child would keep its files open.
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.terminate()  # the launcher forwards SIGTERM to the backend
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def remove_tree(path: str, wait_s: float = 15.0) -> None:
+    """Delete a directory, giving Windows time to release files of processes that just exited."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                print(f"warning: could not remove {path}: {exc}", flush=True)
+                return
+            time.sleep(0.5)
+
+
 def smoke_test(binary: Path, timeout: float = 120.0) -> None:
     """Start the binary like the desktop shell does and check /api/health with the token."""
     token = "smoke-test-token"
-    with tempfile.TemporaryDirectory(prefix="locpilot-smoke-") as data_dir:
+    data_dir = tempfile.mkdtemp(prefix="locpilot-smoke-")
+    try:
         env = {**os.environ, "LOCPILOT_AUTH_TOKEN": token}
         started = time.monotonic()
         proc = subprocess.Popen(
@@ -153,11 +184,9 @@ def smoke_test(binary: Path, timeout: float = 120.0) -> None:
             print(f"smoke test: ready in {ready_s:.1f}s on port {port}; health={health}; "
                   f"setup.ready={setup.get('ready')}; unauthenticated request -> HTTP {unauth_status}")
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            stop_tree(proc)
+    finally:
+        remove_tree(data_dir)
 
 
 def main() -> None:
