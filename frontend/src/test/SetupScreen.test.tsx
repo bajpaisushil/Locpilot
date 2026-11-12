@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { SetupScreen } from '@/components/setup/SetupScreen'
 import type { PullStatus } from '@/lib/types'
 import { json, mockFetch, renderWithProviders } from './utils'
-import { setupModelMissing, setupOllamaMissing, setupStatus } from './fixtures'
+import { setupModelMissing, setupOllamaCannotStart, setupOllamaMissing, setupStatus } from './fixtures'
 
 describe('SetupScreen', () => {
   it('shows a loading state while checking dependencies', () => {
@@ -28,7 +28,11 @@ describe('SetupScreen', () => {
     renderWithProviders(<SetupScreen onContinue={onContinue} onBrowseWithoutAi={() => {}} />)
     expect(await screen.findByTestId('readiness')).toHaveTextContent(/2 required items need attention/i)
     expect(screen.getByTestId('check-ollama')).toHaveAttribute('data-status', 'missing')
-    expect(screen.getByTestId('ollama-guide')).toHaveTextContent('brew install ollama')
+    const guide = screen.getByTestId('ollama-guide')
+    expect(guide).toHaveTextContent('Install Ollama on macOS')
+    expect(guide).toHaveTextContent('brew install ollama')
+    expect(guide).toHaveTextContent(/LocPilot starts it automatically/i)
+    expect(guide).not.toHaveTextContent('ollama serve')
     expect(screen.getByRole('button', { name: /open ollama.com/i })).toBeInTheDocument()
     expect(screen.queryByTestId('model-guide')).not.toBeInTheDocument()
     expect(screen.getByText(/never falls back to cloud AI APIs/i)).toBeInTheDocument()
@@ -40,6 +44,19 @@ describe('SetupScreen', () => {
     const before = calls.filter((c) => c.path === '/api/setup/status').length
     await user.click(screen.getByRole('button', { name: /check again/i }))
     await waitFor(() => expect(calls.filter((c) => c.path === '/api/setup/status').length).toBeGreaterThan(before))
+  })
+
+  it('explains how to start an installed Ollama that LocPilot could not start', async () => {
+    mockFetch({ 'GET /api/setup/status': setupOllamaCannotStart() })
+    renderWithProviders(<SetupScreen onContinue={() => {}} onBrowseWithoutAi={() => {}} />)
+    const check = await screen.findByTestId('check-ollama')
+    expect(check).toHaveAttribute('data-status', 'error')
+    expect(check).toHaveTextContent('could not start it: address already in use')
+    const guide = screen.getByTestId('ollama-guide')
+    expect(guide).toHaveTextContent('Start Ollama')
+    expect(guide).toHaveTextContent('brew services start ollama')
+    expect(guide).not.toHaveTextContent('Install Ollama')
+    expect(guide).not.toHaveTextContent('brew install ollama')
   })
 
   it('downloads a missing model through Ollama and shows progress', async () => {

@@ -1,9 +1,22 @@
 # Troubleshooting
 
-## Setup screen says "Ollama is not reachable"
+## Setup screen says Ollama is missing or could not be started
 
-* Start Ollama: open the **Ollama** app (menu bar) or run `ollama serve`.
-  With Homebrew: `brew services start ollama` keeps it running in the background.
+LocPilot starts an installed Ollama by itself (on launch, and whenever it finds Ollama stopped):
+the Ollama app on macOS if it is installed, otherwise `ollama serve` in the background, which
+LocPilot stops again when it quits. So:
+
+* **"Ollama is not installed on this computer"**: install it (the setup screen links the download,
+  or `brew install ollama`). Nothing else is needed; LocPilot starts it once it is installed.
+* **"…could not start it: …"**: the reason is shown. The output of the `ollama serve` LocPilot ran is
+  in `logs/ollama.log` in the data directory (`~/.locpilot`). A common cause is another program
+  using port 11434. Start it yourself with `ollama serve` (or `brew services start ollama`) to see
+  the error, then click **Check Again**.
+* **Ollama installed somewhere unusual?** Point LocPilot at it with `LOCPILOT_OLLAMA_PATH`.
+* **Linux system service**: an Ollama installed by the official script runs as a systemd service
+  with its own model folder, so LocPilot does not start a second copy as you. Run
+  `sudo systemctl start ollama` (and `sudo systemctl enable ollama` to start it at boot).
+* Prefer to manage Ollama yourself? Set `LOCPILOT_AUTOSTART_OLLAMA=false`.
 * Check it answers: `curl http://127.0.0.1:11434/api/version`.
 * Using a non-default address? Set `LOCPILOT_OLLAMA_URL`. LocPilot refuses non-loopback
   addresses unless `LOCPILOT_ALLOW_REMOTE_OLLAMA=true` (it never falls back to a cloud API).

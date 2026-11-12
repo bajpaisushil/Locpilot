@@ -71,9 +71,8 @@ cloud model fallback.
 # 1. project dependencies (Python venv + npm); add flags to install tools/Ollama/model
 scripts/setup_macos.sh                    # --install-tools --install-ollama --pull-model --with-rust
 
-# 2. local model (skip if you used --pull-model)
-ollama serve &                            # or open the Ollama app
-ollama pull qwen2.5-coder:7b
+# 2. local model (skip if you used --pull-model); LocPilot starts an installed Ollama by itself
+ollama pull qwen2.5-coder:7b              # needs Ollama running: `ollama serve` or the Ollama app
 
 # 3a. run as a desktop app (dev build; needs Rust)
 uv run --project backend python scripts/build_sidecar.py   # bundle the Python backend for Tauri

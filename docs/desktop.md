@@ -72,8 +72,14 @@ The setup screen (also reachable from **Settings → Open setup**, the wrench bu
 model status pill) polls `/api/setup/status` every 3 s until everything required is ready, and has a
 **Check Again** button. It shows:
 
-- **Ollama**: reachable or not, with OS-specific install steps from the backend (download page, opened
-  in the system browser, or `brew install ollama`) and how to start it.
+- **Ollama**: running, or why not. The backend starts an installed Ollama itself (at launch and whenever
+  a status check, a model download or a new task finds it stopped): on macOS it opens the Ollama app when
+  that is installed, otherwise it runs `ollama serve` in the background (output in `logs/ollama.log`) and
+  stops it again when LocPilot quits. So the screen shows OS-specific **install** steps only when Ollama
+  is not installed (download page, opened in the system browser, or `brew install ollama`), and **start**
+  steps only when it is installed but could not be started (with the reason). A Linux systemd install is
+  never started as the user (it has its own model folder); the screen asks for `sudo systemctl start ollama`.
+  `LOCPILOT_AUTOSTART_OLLAMA=false` turns this off; `LOCPILOT_OLLAMA_PATH` names a non-standard binary.
 - **Model** (default `qwen2.5-coder:7b`): installed or not. Users can copy `ollama pull <model>` or
   click **Download <model> with Ollama**, which asks the local Ollama daemon to pull the model and shows
   live progress. They can also switch to a model that is already installed.

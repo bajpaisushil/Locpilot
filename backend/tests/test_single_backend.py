@@ -18,7 +18,7 @@ from tests.test_agent import Harness
 
 def _start_backend(data_dir, capture_stderr: bool = False, lock_wait_s: float = 1.0) -> subprocess.Popen:
     # Undrained pipes can block a child on macOS (small pipe buffers), so stderr is discarded unless read.
-    env = {**os.environ, "LOCPILOT_LOCK_WAIT_S": str(lock_wait_s)}
+    env = {**os.environ, "LOCPILOT_LOCK_WAIT_S": str(lock_wait_s), "LOCPILOT_AUTOSTART_OLLAMA": "false"}
     return subprocess.Popen([sys.executable, "-m", "locpilot.main", "--port", "0", "--data-dir", str(data_dir)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
                             text=True, env=env)

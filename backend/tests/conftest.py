@@ -54,8 +54,9 @@ def make_repo(dest: Path, fixture: str | None = None, files: dict[str, str] | No
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
+    # autostart_ollama off: a test must never start the developer's real Ollama (tests that cover it use a fake).
     s = Settings(data_dir=tmp_path / "data", allowed_repo_roots=[tmp_path], command_timeout_s=60,
-                 max_llm_calls=30)
+                 max_llm_calls=30, autostart_ollama=False)
     s.ensure_dirs()
     return s
 

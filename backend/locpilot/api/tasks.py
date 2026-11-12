@@ -62,6 +62,7 @@ def task_detail(request: Request, task_id: str) -> dict:
 
 
 async def _require_model(request: Request) -> str:
+    await request.app.state.ollama_launcher.ensure_running(wait_s=30.0)  # start an installed, stopped Ollama
     llm = request.app.state.llm_factory()
     try:
         await llm.ensure_ready()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
@@ -15,6 +16,7 @@ from locpilot import __version__
 from locpilot.agent.runner import TaskManager
 from locpilot.api import repos, setup, tasks, terminals
 from locpilot.config import Settings, get_settings
+from locpilot.llm.launcher import OllamaLauncher
 from locpilot.llm.ollama import LLMClient, OllamaClient
 from locpilot.security.http import LocalSecurityMiddleware
 from locpilot.storage.db import Database
@@ -43,17 +45,26 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     terminal_manager = TerminalManager(shell=settings.terminal_shell, max_terminals=settings.max_terminals,
                                        scrollback_chars=settings.terminal_scrollback_chars)
 
+    # Only the real Ollama client needs a running Ollama; tests inject a scripted model instead.
+    launcher = OllamaLauncher(settings.ollama_url, settings.logs_dir,
+                              enabled=settings.autostart_ollama and llm_factory is None,
+                              ollama_path=settings.ollama_path, start_timeout_s=settings.ollama_start_timeout_s)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await manager.startup()
+        # Start an installed Ollama in the background so it is usually up before the UI first asks.
+        autostart = asyncio.create_task(launcher.ensure_running(wait_s=settings.ollama_start_timeout_s))
         try:
             yield
         finally:
+            autostart.cancel()
             job = app.state.pull.get("task")
             if job is not None and not job.done():
                 job.cancel()
             await terminal_manager.shutdown()
             await manager.shutdown()
+            await launcher.shutdown()
             db.close()
 
     app = FastAPI(title="LocPilot local API", version=__version__, lifespan=lifespan,
@@ -63,6 +74,7 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     app.state.manager = manager
     app.state.terminals = terminal_manager
     app.state.llm_factory = factory
+    app.state.ollama_launcher = launcher
     app.state.pull = {"model": None, "state": "idle", "status_text": "", "completed": None, "total": None,
                       "error": None}
 

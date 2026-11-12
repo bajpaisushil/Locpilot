@@ -70,7 +70,8 @@ interface SetupStatus {
   platform: "macos" | "windows" | "linux" | "other";
   ollama_url: string; model: string; installed_models: string[];
   checks: SetupCheck[];
-  ollama_install: InstallStep[];        // OS-specific instructions to install & start Ollama
+  ollama_installed: boolean;            // Ollama is on this computer (the backend starts it when stopped)
+  ollama_install: InstallStep[];        // not installed: how to install it; installed: how to start it by hand
   model_install: InstallStep[];         // e.g. `ollama pull qwen2.5-coder:7b`
   cloud_fallback: false;                // LocPilot never falls back to cloud APIs
   checked_at: string;

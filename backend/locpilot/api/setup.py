@@ -10,6 +10,7 @@ from fastapi import APIRouter, Request
 from locpilot import __version__
 from locpilot.api.models import ApiError, ModelConfigUpdate, PullRequest, db_of, settings_of
 from locpilot.config import platform_name
+from locpilot.llm.launcher import DEFAULT_ADDRESS, LaunchInfo, OllamaInstall, listen_address, ollama_host_value
 from locpilot.llm.ollama import MODEL_NAME_RE, LLMResponseError, LLMUnavailableError
 from locpilot.security.sandbox import detect_sandbox
 from locpilot.tools import git
@@ -22,55 +23,114 @@ async def health() -> dict:
     return {"status": "ok", "version": __version__}
 
 
-def _install_steps(platform: str, model: str, ollama_url: str) -> tuple[list[dict], list[dict]]:
-    address = ollama_url.split("://", 1)[-1]
-    def step(title: str, command: str | None = None, url: str | None = None, description: str | None = None) -> dict:
-        return {"title": title, "command": command, "url": url, "description": description}
+async def ensure_ollama(request: Request, wait_s: float = 20.0) -> LaunchInfo:
+    """Start the installed Ollama if it is not running (no-op when it runs, isn't installed, or is remote)."""
+    return await request.app.state.ollama_launcher.ensure_running(wait_s=wait_s)
 
+
+def _step(title: str, command: str | None = None, url: str | None = None, description: str | None = None) -> dict:
+    return {"title": title, "command": command, "url": url, "description": description}
+
+
+def _install_steps(platform: str) -> list[dict]:
+    """How to install Ollama. Once installed, LocPilot starts it by itself."""
+    auto = "Once it is installed, LocPilot starts it automatically."
     if platform == "macos":
-        ollama = [
-            step("Download and install Ollama for macOS", url="https://ollama.com/download/mac",
-                 description="LocPilot does not bundle Ollama. Install the Ollama app, or use Homebrew below."),
-            step("Or install with Homebrew", command="brew install ollama"),
-            step("Start Ollama", command="ollama serve",
-                 description=f"Or open the Ollama app — it runs in the menu bar. LocPilot expects it at {address}."),
+        return [
+            _step("Download and install Ollama for macOS", url="https://ollama.com/download/mac",
+                  description=f"LocPilot does not bundle Ollama. Install the Ollama app, or use Homebrew below. {auto}"),
+            _step("Or install with Homebrew", command="brew install ollama", description=auto),
         ]
-    elif platform == "windows":
-        ollama = [
-            step("Download and install Ollama for Windows", url="https://ollama.com/download/windows",
-                 description="LocPilot does not bundle Ollama. After installing, Ollama runs in the system tray."),
-            step("Start Ollama", command="ollama serve", description="Only needed if the tray app is not running."),
+    if platform == "windows":
+        return [
+            _step("Download and install Ollama for Windows", url="https://ollama.com/download/windows",
+                  description=f"LocPilot does not bundle Ollama. {auto}"),
         ]
-    else:
-        ollama = [
-            step("Install Ollama for Linux", url="https://ollama.com/download/linux",
-                 command="curl -fsSL https://ollama.com/install.sh | sh",
-                 description="Review the install script before running it, or follow the manual instructions."),
-            step("Start Ollama", command="ollama serve", description="Or: sudo systemctl start ollama"),
-        ]
-    models = [
-        step(f"Download the model {model}", command=f"ollama pull {model}",
-             description="Downloads several GB once; afterwards LocPilot works fully offline. You can also start "
-                         "the download from this screen."),
-        step("Or pick a different installed model in Settings",
-             description="Any local Ollama chat model works; 7B+ code models give the best results."),
+    return [
+        _step("Install Ollama for Linux", url="https://ollama.com/download/linux",
+              command="curl -fsSL https://ollama.com/install.sh | sh",
+              description="Review the install script before running it, or follow the manual instructions. "
+                          "The installer starts Ollama as a system service."),
     ]
-    return ollama, models
+
+
+def _start_steps(platform: str, install: OllamaInstall, ollama_url: str, log_path: str) -> list[dict]:
+    """How to start an installed Ollama by hand (LocPilot tried and could not, or autostart is off)."""
+    if install.kind == "service":
+        return [_step("Start the Ollama service", command="sudo systemctl start ollama",
+                      description="`sudo systemctl enable ollama` also starts it whenever the computer boots.")]
+    custom = listen_address(ollama_url) != DEFAULT_ADDRESS
+    if install.kind == "app" and not custom:
+        return [_step("Open the Ollama app", command="open -a Ollama",
+                      description="It runs in the menu bar and keeps running in the background.")]
+    serve = f"OLLAMA_HOST={ollama_host_value(ollama_url)} ollama serve" if custom else "ollama serve"
+    steps = [_step("Start Ollama", command=serve,
+                   description=f"Keep that terminal open while you use LocPilot. Output of the Ollama LocPilot "
+                               f"starts is written to {log_path}.")]
+    resolved = str(install.path.resolve()) if install.kind == "cli" else ""
+    if platform == "macos" and ("/homebrew/" in resolved or "/Cellar/" in resolved) and not custom:
+        steps.append(_step("Or keep it running in the background (Homebrew)", command="brew services start ollama",
+                           description="Starts Ollama now and whenever you log in."))
+    elif platform == "windows":
+        steps.append(_step("Or open Ollama from the Start menu", description="It runs in the system tray."))
+    return steps
+
+
+def _model_steps(model: str) -> list[dict]:
+    return [
+        _step(f"Download the model {model}", command=f"ollama pull {model}",
+              description="Downloads several GB once; afterwards LocPilot works fully offline. You can also start "
+                          "the download from this screen."),
+        _step("Or pick a different installed model in Settings",
+              description="Any local Ollama chat model works; 7B+ code models give the best results."),
+    ]
+
+
+def _ollama_check(status: dict, launch: LaunchInfo, install: OllamaInstall | None, log_path: str) -> dict:
+    check = {"id": "ollama", "label": "Ollama", "required": True}
+    url = status["ollama_url"]
+    if status["ollama_reachable"]:
+        by = " (started by LocPilot)" if launch.started_by_locpilot else ""
+        return {**check, "status": "ok", "detail": f"Ollama {status['ollama_version']} is running at {url}{by}",
+                "hint": None}
+    where = install.describe() if install else None
+    if launch.state == "failed":
+        detail = (f"Ollama is installed ({where}), but LocPilot could not start it: {launch.error}" if where
+                  else f"LocPilot could not start Ollama: {launch.error}")
+        logged = f" LocPilot's attempt is logged in {log_path}." if install and install.kind == "cli" else ""
+        return {**check, "status": "error", "detail": detail,
+                "hint": f"Start it yourself (see below). LocPilot tries again automatically.{logged}"}
+    if launch.state == "starting":
+        return {**check, "status": "missing", "detail": f"Starting Ollama ({where})…",
+                "hint": "This usually takes a few seconds."}
+    if launch.state == "service_stopped":
+        return {**check, "status": "missing",
+                "detail": f"Ollama is installed as {where}, but the service is not running",
+                "hint": "Start it with `sudo systemctl start ollama`."}
+    if launch.state == "not_installed" or (launch.state == "disabled" and install is None):
+        return {**check, "status": "missing", "detail": "Ollama is not installed on this computer",
+                "hint": "Install Ollama (see below). LocPilot starts it automatically once it is installed."}
+    if launch.state == "disabled":
+        return {**check, "status": "missing", "detail": f"Ollama is installed ({where}) but is not running at {url}",
+                "hint": "Start it (see below). LocPilot does not start it itself because "
+                        "LOCPILOT_AUTOSTART_OLLAMA is off."}
+    # A remote Ollama URL, or Ollama stopped answering between the two checks.
+    return {**check, "status": "missing", "detail": status["error"] or f"Ollama is not reachable at {url}",
+            "hint": status["hint"]}
 
 
 @router.get("/setup/status")
 async def setup_status(request: Request) -> dict:
     settings = settings_of(request)
+    launcher = request.app.state.ollama_launcher
+    launch = await ensure_ollama(request)
     llm = request.app.state.llm_factory()
     status = await llm.status()
-    checks = []
-    if status["ollama_reachable"]:
-        checks.append({"id": "ollama", "label": "Ollama", "status": "ok", "required": True,
-                       "detail": f"Ollama {status['ollama_version']} is running at {status['ollama_url']}",
-                       "hint": None})
-    else:
-        checks.append({"id": "ollama", "label": "Ollama", "status": "missing", "required": True,
-                       "detail": status["error"] or "Ollama is not reachable", "hint": status["hint"]})
+    install = None
+    if not status["ollama_reachable"] and launch.state != "remote":
+        install = launch.install or (None if launch.state == "not_installed" else launcher.installation())
+    log_path = str(launcher.log_path)
+    checks = [_ollama_check(status, launch, install, log_path)]
     if not status["ollama_reachable"]:
         checks.append({"id": "model", "label": f"Model {llm.model}", "status": "missing", "required": True,
                        "detail": "Waiting for Ollama — the model can be checked once Ollama is running.",
@@ -91,12 +151,15 @@ async def setup_status(request: Request) -> dict:
     checks.append({"id": "sandbox", "label": "Test command sandbox", "status": "ok" if sandbox.available else "warning",
                    "required": False, "detail": sandbox.description,
                    "hint": None if sandbox.available else "Approved test commands will run without OS sandboxing."})
-    ollama_steps, model_steps = _install_steps(platform_name(), llm.model, settings.ollama_url)
+    platform = platform_name()
+    ollama_steps = (_start_steps(platform, install, settings.ollama_url, log_path) if install
+                    else _install_steps(platform))
     return {
         "ready": all(c["status"] == "ok" for c in checks if c["required"]),
-        "platform": platform_name(), "ollama_url": settings.ollama_url, "model": llm.model,
+        "platform": platform, "ollama_url": settings.ollama_url, "model": llm.model,
         "installed_models": [m["name"] for m in status["models"]], "checks": checks,
-        "ollama_install": ollama_steps, "model_install": model_steps, "cloud_fallback": False,
+        "ollama_installed": status["ollama_reachable"] or install is not None,
+        "ollama_install": ollama_steps, "model_install": _model_steps(llm.model), "cloud_fallback": False,
         "checked_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
 
@@ -115,6 +178,7 @@ async def pull_status(request: Request) -> dict:
 @router.post("/setup/pull-model")
 async def pull_model(body: PullRequest, request: Request) -> dict:
     job = _pull_state(request)
+    await ensure_ollama(request)
     llm = request.app.state.llm_factory()
     model = body.model or llm.model
     if not MODEL_NAME_RE.match(model):
@@ -141,6 +205,7 @@ async def pull_model(body: PullRequest, request: Request) -> dict:
 
 @router.get("/model/status")
 async def model_status(request: Request) -> dict:
+    await ensure_ollama(request, wait_s=10.0)
     return await request.app.state.llm_factory().status()
 
 

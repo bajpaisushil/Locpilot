@@ -255,8 +255,15 @@ export function SetupScreen({
           <section className="space-y-3 rounded-lg border bg-card p-4" data-testid="ollama-guide">
             <div className="flex items-center gap-2">
               <PackageIcon className="size-4 text-primary" />
-              <h3 className="text-sm font-semibold">Install and start Ollama on {PLATFORM_LABEL[data.platform]}</h3>
+              <h3 className="text-sm font-semibold">
+                {data.ollama_installed ? 'Start Ollama' : `Install Ollama on ${PLATFORM_LABEL[data.platform]}`}
+              </h3>
             </div>
+            {!data.ollama_installed && (
+              <p className="text-xs text-muted-foreground">
+                Once Ollama is installed, LocPilot starts it automatically — there is nothing to run by hand.
+              </p>
+            )}
             <Steps steps={data.ollama_install} />
           </section>
         )}

@@ -40,6 +40,9 @@ export interface SetupStatus {
   model: string
   installed_models: string[]
   checks: SetupCheck[]
+  /** Ollama is on this computer (running or not). LocPilot starts an installed Ollama by itself. */
+  ollama_installed: boolean
+  /** Not installed: how to install it. Installed but not running: how to start it by hand. */
   ollama_install: InstallStep[]
   model_install: InstallStep[]
   cloud_fallback: false

@@ -48,6 +48,9 @@ class Settings(BaseSettings):
 
     ollama_url: str = "http://127.0.0.1:11434"
     allow_remote_ollama: bool = False
+    autostart_ollama: bool = True  # start an installed-but-stopped local Ollama (see llm/launcher.py)
+    ollama_path: Path | None = None  # the ollama binary to start; default: found automatically
+    ollama_start_timeout_s: float = 45.0
     model: str = "qwen2.5-coder:7b"
     num_ctx: int = 16384
     temperature: float = 0.1
@@ -92,7 +95,7 @@ class Settings(BaseSettings):
             return [Path(os.path.expanduser(str(v))) for v in value]
         return value
 
-    @field_validator("data_dir", mode="before")
+    @field_validator("data_dir", "ollama_path", mode="before")
     @classmethod
     def _expand_data_dir(cls, value: object) -> object:
         if isinstance(value, str):

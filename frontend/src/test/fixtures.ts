@@ -23,10 +23,10 @@ export function setupStatus(overrides: Partial<SetupStatus> = {}): SetupStatus {
       { id: 'git', label: 'Git', status: 'ok', required: true, detail: 'git version 2.51.0', hint: null },
       { id: 'sandbox', label: 'Test command sandbox', status: 'ok', required: false, detail: 'macOS Seatbelt', hint: null },
     ],
+    ollama_installed: true,
     ollama_install: [
       { title: 'Download and install Ollama for macOS', command: null, url: 'https://ollama.com/download/mac', description: null },
       { title: 'Or install with Homebrew', command: 'brew install ollama', url: null, description: null },
-      { title: 'Start Ollama', command: 'ollama serve', url: null, description: null },
     ],
     model_install: [{ title: 'Download the model', command: 'ollama pull qwen2.5-coder:7b', url: null, description: null }],
     cloud_fallback: false,
@@ -41,12 +41,35 @@ export function setupOllamaMissing(): SetupStatus {
     ...base,
     ready: false,
     installed_models: [],
+    ollama_installed: false,
     checks: base.checks.map((c) =>
       c.id === 'ollama'
-        ? { ...c, status: 'missing', detail: 'Ollama is not reachable at http://127.0.0.1:11434', hint: 'Install and start Ollama' }
+        ? { ...c, status: 'missing', detail: 'Ollama is not installed on this computer', hint: 'Install Ollama' }
         : c.id === 'model'
           ? { ...c, status: 'missing', detail: 'Cannot check models while Ollama is offline' }
           : c,
+    ),
+  }
+}
+
+export function setupOllamaCannotStart(): SetupStatus {
+  const base = setupOllamaMissing()
+  return {
+    ...base,
+    ollama_installed: true,
+    ollama_install: [
+      { title: 'Start Ollama', command: 'ollama serve', url: null, description: null },
+      { title: 'Or keep it running in the background (Homebrew)', command: 'brew services start ollama', url: null, description: null },
+    ],
+    checks: base.checks.map((c) =>
+      c.id === 'ollama'
+        ? {
+            ...c,
+            status: 'error',
+            detail: 'Ollama is installed (/opt/homebrew/bin/ollama), but LocPilot could not start it: address already in use',
+            hint: 'Start it yourself (see below). LocPilot tries again automatically.',
+          }
+        : c,
     ),
   }
 }

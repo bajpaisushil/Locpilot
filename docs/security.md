@@ -31,6 +31,7 @@ guarantee.
 | Prompt injection | Repository content is treated as untrusted data and delimited in prompts; the system prompt tells the model to ignore embedded instructions. More importantly, the model **cannot do anything dangerous on its own**: tools are read-only, edits and commands require human approval and pass deterministic policy checks. |
 | Telemetry | None. LangSmith/LangChain tracing is force-disabled and related API keys are removed from the backend environment at startup. |
 | Remote models | Non-loopback Ollama URLs are refused unless `LOCPILOT_ALLOW_REMOTE_OLLAMA=true`. There is no hosted (cloud) model fallback of any kind. |
+| Starting Ollama | Only for a loopback Ollama URL, and only an Ollama already installed on the machine (nothing is downloaded). `ollama serve` gets the user's environment minus every `LOCPILOT_*` variable (so never the API token), listens only on the configured loopback address, and is stopped when LocPilot quits. |
 
 ## What is NOT guaranteed
 
