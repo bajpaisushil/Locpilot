@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -52,6 +53,9 @@ class Settings(BaseSettings):
     ollama_path: Path | None = None  # the ollama binary to start; default: found automatically
     ollama_start_timeout_s: float = 45.0
     model: str = "qwen2.5-coder:7b"
+    # How long Ollama keeps the model in RAM after LocPilot's last request ("10m", "1h", "0" = unload at once).
+    # LocPilot also unloads it when LocPilot quits or you switch models.
+    ollama_keep_alive: str = "30m"
     num_ctx: int = 16384
     temperature: float = 0.1
     llm_timeout_s: float = 900.0
@@ -106,6 +110,14 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_url(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("ollama_keep_alive")
+    @classmethod
+    def _check_keep_alive(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"-?\d+(\.\d+)?(ms|s|m|h)?", value):
+            raise ValueError('use a duration such as "10m", "1h" or "0"')
+        return value
 
     # Derived paths -----------------------------------------------------------------
     @property

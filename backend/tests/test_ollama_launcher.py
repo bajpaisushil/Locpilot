@@ -1,7 +1,8 @@
 """Starting an installed-but-stopped Ollama, and what the setup screen says when it can't.
 
-A fake ``ollama`` executable stands in for the real one: ``ollama serve`` runs a tiny HTTP server that
-answers ``/api/version`` and ``/api/tags`` on ``OLLAMA_HOST``, exactly where LocPilot connects.
+A fake ``ollama`` executable stands in for the real one: ``ollama serve`` runs a tiny HTTP server on
+``OLLAMA_HOST`` (exactly where LocPilot connects) that answers version, model list, loaded models, chat
+and unload requests, and can record the POST requests it gets.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from locpilot.llm.launcher import ollama_host_value
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="fake ollama is a POSIX script")
 
 FAKE_SERVER = r'''
-import json, os, sys
+import json, os, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 if sys.argv[1:] != ["serve"]:
@@ -35,23 +36,49 @@ if os.environ.get("FAKE_OLLAMA_MODE") == "fail":
     sys.exit(1)
 host, _, port = os.environ["OLLAMA_HOST"].rpartition(":")
 leaked = sorted(k for k in os.environ if k.upper().startswith("LOCPILOT_"))
+record = os.environ.get("FAKE_OLLAMA_RECORD")
+loaded = [m for m in os.environ.get("FAKE_OLLAMA_LOADED", "").split(",") if m]  # models in "RAM"
+lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/api/version":
-            body = {"version": "0.0.0-fake", "leaked_env": leaked}
-        elif self.path == "/api/tags":
-            body = {"models": [{"name": "qwen2.5-coder:7b", "size": 4_700_000_000, "details": {}}]}
-        else:
-            self.send_response(404)
-            self.end_headers()
-            return
-        data = json.dumps(body).encode()
+    def reply(self, body, ndjson=False):
+        data = ("".join(json.dumps(b) + "\n" for b in body) if ndjson else json.dumps(body)).encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/x-ndjson" if ndjson else "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/api/version":
+            self.reply({"version": "0.0.0-fake", "leaked_env": leaked})
+        elif self.path == "/api/tags":
+            self.reply({"models": [{"name": n, "size": 4_700_000_000, "details": {}}
+                                   for n in ("qwen2.5-coder:7b", "llama3.2:3b")]})
+        elif self.path == "/api/ps":
+            with lock:
+                self.reply({"models": [{"name": m, "model": m} for m in loaded]})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        if record:
+            with lock, open(record, "a") as fh:
+                fh.write(json.dumps({"path": self.path, "model": body.get("model"),
+                                     "keep_alive": body.get("keep_alive")}) + "\n")
+        with lock:
+            if self.path == "/api/generate" and body.get("keep_alive") == 0:
+                if body.get("model") in loaded:
+                    loaded.remove(body["model"])
+            elif body.get("model") not in loaded:
+                loaded.append(body["model"])  # a chat (or load) request puts the model in memory
+        if self.path == "/api/chat":
+            self.reply([{"message": {"content": "ok"}, "done": False},
+                        {"done": True, "prompt_eval_count": 3, "eval_count": 1, "done_reason": "stop"}], ndjson=True)
+        else:
+            self.reply({"model": body.get("model"), "done": True})
 
     def log_message(self, *args):
         pass

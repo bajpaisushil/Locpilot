@@ -35,7 +35,22 @@ LocPilot stops again when it quits. So:
   (Docker, browsers) or lower the context: Settings → context size, or
   `LOCPILOT_NUM_CTX=8192`.
 * First request after a while is slow because Ollama loads the model (5–60 s). LocPilot
-  asks Ollama to keep it loaded for 30 minutes.
+  asks Ollama to keep it loaded for 30 minutes after the last request
+  (`LOCPILOT_OLLAMA_KEEP_ALIVE`, e.g. `10m`, or `0` to unload after every request).
+
+## Is the model using my RAM when LocPilot is closed?
+
+No. The model file (≈4.7 GB for `qwen2.5-coder:7b`) only takes disk space until Ollama
+loads it, which happens on LocPilot's first request. LocPilot frees it again:
+
+* **when LocPilot quits**: it unloads the models it loaded (or stops the `ollama serve` it
+  started, which frees everything). Models another program loaded are left alone;
+* **when you switch models** in Settings: the previous one is unloaded right away;
+* **when it is idle** for the keep-alive time above, Ollama unloads it by itself.
+
+An idle Ollama with no model loaded uses about 30 MB. To check or free memory by hand:
+`ollama ps` (what is loaded), `ollama stop qwen2.5-coder:7b` (unload now),
+`brew services stop ollama` (stop a Homebrew-run Ollama; LocPilot starts it again when needed).
 * On 8 GB machines try a smaller model such as `qwen2.5-coder:3b` (lower quality).
 * Expect 1–4 minutes for an Ask-mode investigation and 3–8 minutes for a Code-mode fix
   with verification on an Apple M-series laptop.

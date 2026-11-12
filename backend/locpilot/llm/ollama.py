@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeVar
 
 import httpx
@@ -21,6 +22,7 @@ from pydantic import BaseModel, ValidationError
 
 from locpilot.config import ollama_url_is_local
 
+log = logging.getLogger("locpilot.ollama")
 T = TypeVar("T", bound=BaseModel)
 ProgressCallback = Callable[[int], Awaitable[None]]
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:]{0,199}$")
@@ -34,6 +36,18 @@ class LLMUnavailableError(RuntimeError):
 
 class LLMResponseError(RuntimeError):
     pass
+
+
+@dataclass
+class ModelUsage:
+    """Models this LocPilot run made Ollama load into memory, so it can free them again (shared by clients)."""
+
+    loaded: set[str] = field(default_factory=set)  # loaded because of LocPilot: LocPilot frees them
+    checked: set[str] = field(default_factory=set)  # models whose prior state has been looked at
+
+    def forget(self, model: str) -> None:
+        self.loaded.discard(model)
+        self.checked.discard(model)
 
 
 @dataclass
@@ -99,7 +113,8 @@ def setup_hint(base_url: str, model: str) -> str:
 
 class OllamaClient:
     def __init__(self, base_url: str, model: str, *, num_ctx: int = 16384, temperature: float = 0.1,
-                 timeout_s: float = 900.0, seed: int | None = 7, allow_remote: bool = False) -> None:
+                 timeout_s: float = 900.0, seed: int | None = 7, allow_remote: bool = False,
+                 keep_alive: str = "30m", usage: ModelUsage | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.num_ctx = num_ctx
@@ -107,6 +122,8 @@ class OllamaClient:
         self.timeout_s = timeout_s
         self.seed = seed
         self.allow_remote = allow_remote
+        self.keep_alive = keep_alive  # how long Ollama keeps the model in RAM after the last request
+        self.usage = usage
 
     def _check_local(self) -> None:
         if not self.allow_remote and not ollama_url_is_local(self.base_url):
@@ -140,6 +157,42 @@ class OllamaClient:
         candidates = {model, model if ":" in model else f"{model}:latest"}
         return any(n in candidates for n in names)
 
+    async def loaded_models(self) -> list[str]:
+        """Models Ollama currently holds in memory."""
+        self._check_local()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+            resp = await client.get(f"{self.base_url}/api/ps")
+            resp.raise_for_status()
+            return [m.get("name") or m.get("model") for m in resp.json().get("models", []) if m.get("name") or m.get("model")]
+
+    async def unload_models(self, models: Iterable[str]) -> list[str]:
+        """Free the memory of those ``models`` that Ollama has loaded. Never loads a model to do so.
+
+        Returns the models unloaded. Errors are logged, not raised: this runs on shutdown and model switches.
+        """
+        wanted = [m for m in dict.fromkeys(models) if m]
+        if not wanted:
+            return []
+        try:
+            loaded = await self.loaded_models()
+        except (httpx.HTTPError, LLMUnavailableError, ValueError) as exc:
+            log.info("could not list loaded models: %s", exc)
+            return []
+        unloaded = []
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            for model in wanted:
+                if not self.model_installed(model, loaded):
+                    continue
+                try:
+                    resp = await client.post(f"{self.base_url}/api/generate", json={"model": model, "keep_alive": 0})
+                    resp.raise_for_status()
+                except httpx.HTTPError as exc:
+                    log.info("could not unload %s: %s", model, exc)
+                    continue
+                log.info("unloaded %s from memory", model)
+                unloaded.append(model)
+        return unloaded
+
     async def status(self) -> dict:
         info: dict[str, Any] = {"ollama_reachable": False, "ollama_version": None, "ollama_url": self.base_url,
                                 "configured_model": self.model, "model_available": False, "models": [],
@@ -167,15 +220,29 @@ class OllamaClient:
         if not status["ollama_reachable"] or not status["model_available"]:
             raise LLMUnavailableError(status["error"] or "Model unavailable", status["hint"])
 
+    async def _note_usage(self) -> None:
+        """Before the first request for a model: if Ollama doesn't hold it yet, this request loads it for us."""
+        usage = self.usage
+        if usage is None or self.model in usage.checked:
+            return
+        usage.checked.add(self.model)
+        try:
+            already = self.model_installed(self.model, await self.loaded_models())
+        except (httpx.HTTPError, ValueError):
+            already = False
+        if not already:  # a model another program loaded is left to that program
+            usage.loaded.add(self.model)
+
     async def chat(self, messages: list[dict], *, schema: dict | None = None, max_tokens: int = 1024,
                    on_progress: ProgressCallback | None = None, temperature: float | None = None) -> LLMResult:
         self._check_local()
+        await self._note_usage()
         options: dict[str, Any] = {"num_ctx": self.num_ctx, "num_predict": max_tokens, "top_p": 0.9,
                                    "temperature": self.temperature if temperature is None else temperature}
         if self.seed is not None:
             options["seed"] = self.seed
         payload: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True,
-                                   "keep_alive": "30m", "options": options}
+                                   "keep_alive": self.keep_alive, "options": options}
         if schema is not None:
             payload["format"] = schema
         timeout = httpx.Timeout(connect=5.0, read=self.timeout_s, write=60.0, pool=5.0)

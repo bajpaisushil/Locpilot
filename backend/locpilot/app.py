@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
@@ -17,13 +18,14 @@ from locpilot.agent.runner import TaskManager
 from locpilot.api import repos, setup, tasks, terminals
 from locpilot.config import Settings, get_settings
 from locpilot.llm.launcher import OllamaLauncher
-from locpilot.llm.ollama import LLMClient, OllamaClient
+from locpilot.llm.ollama import LLMClient, ModelUsage, OllamaClient
 from locpilot.security.http import LocalSecurityMiddleware
 from locpilot.storage.db import Database
 from locpilot.tools.terminal import TerminalManager
 
 
-def default_llm_factory(settings: Settings, db: Database) -> Callable[[], OllamaClient]:
+def default_llm_factory(settings: Settings, db: Database,
+                        usage: ModelUsage | None = None) -> Callable[[], OllamaClient]:
     def factory() -> OllamaClient:
         model = db.get_setting("model") or settings.model
         num_ctx = db.get_setting("num_ctx") or settings.num_ctx
@@ -31,7 +33,8 @@ def default_llm_factory(settings: Settings, db: Database) -> Callable[[], Ollama
         return OllamaClient(settings.ollama_url, model, num_ctx=int(num_ctx),
                             temperature=settings.temperature if temperature is None else float(temperature),
                             timeout_s=settings.llm_timeout_s, seed=settings.llm_seed,
-                            allow_remote=settings.allow_remote_ollama)
+                            allow_remote=settings.allow_remote_ollama, keep_alive=settings.ollama_keep_alive,
+                            usage=usage)
 
     return factory
 
@@ -40,7 +43,8 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     settings = settings or get_settings()
     settings.ensure_dirs()
     db = Database(settings.db_path)
-    factory = llm_factory or default_llm_factory(settings, db)
+    usage = ModelUsage()  # models this run made Ollama load; freed again on quit
+    factory = llm_factory or default_llm_factory(settings, db, usage)
     manager = TaskManager(settings, db, factory)
     terminal_manager = TerminalManager(shell=settings.terminal_shell, max_terminals=settings.max_terminals,
                                        scrollback_chars=settings.terminal_scrollback_chars)
@@ -49,6 +53,17 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     launcher = OllamaLauncher(settings.ollama_url, settings.logs_dir,
                               enabled=settings.autostart_ollama and llm_factory is None,
                               ollama_path=settings.ollama_path, start_timeout_s=settings.ollama_start_timeout_s)
+
+    async def release_models() -> None:
+        """Free the RAM of the models LocPilot loaded. An Ollama LocPilot started is stopped anyway."""
+        if not usage.loaded or launcher.owns_process:
+            return
+        client = factory()
+        if isinstance(client, OllamaClient):
+            try:
+                await asyncio.wait_for(client.unload_models(sorted(usage.loaded)), timeout=10)
+            except TimeoutError:
+                logging.getLogger("locpilot.ollama").warning("unloading models on shutdown timed out")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -64,6 +79,7 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
                 job.cancel()
             await terminal_manager.shutdown()
             await manager.shutdown()
+            await release_models()
             await launcher.shutdown()
             db.close()
 
@@ -75,6 +91,7 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     app.state.terminals = terminal_manager
     app.state.llm_factory = factory
     app.state.ollama_launcher = launcher
+    app.state.model_usage = usage
     app.state.pull = {"model": None, "state": "idle", "status_text": "", "completed": None, "total": None,
                       "error": None}
 

@@ -11,7 +11,7 @@ from locpilot import __version__
 from locpilot.api.models import ApiError, ModelConfigUpdate, PullRequest, db_of, settings_of
 from locpilot.config import platform_name
 from locpilot.llm.launcher import DEFAULT_ADDRESS, LaunchInfo, OllamaInstall, listen_address, ollama_host_value
-from locpilot.llm.ollama import MODEL_NAME_RE, LLMResponseError, LLMUnavailableError
+from locpilot.llm.ollama import MODEL_NAME_RE, LLMResponseError, LLMUnavailableError, OllamaClient
 from locpilot.security.sandbox import detect_sandbox
 from locpilot.tools import git
 
@@ -213,7 +213,13 @@ async def model_status(request: Request) -> dict:
 async def model_config(body: ModelConfigUpdate, request: Request) -> dict:
     db = db_of(request)
     if body.model is not None:
+        previous = request.app.state.llm_factory()
         db.set_setting("model", body.model)
+        usage = request.app.state.model_usage
+        if body.model != previous.model and previous.model in usage.loaded and isinstance(previous, OllamaClient):
+            # Switching models: free the old one's RAM now instead of after the idle timeout.
+            usage.forget(previous.model)
+            await previous.unload_models([previous.model])
     if body.num_ctx is not None:
         db.set_setting("num_ctx", body.num_ctx)
     if body.temperature is not None:
