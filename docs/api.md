@@ -57,7 +57,7 @@ to browser JS). In Tauri, the UI calls the Tauri command `backend_info` to get
 |---|---|---|
 | GET | `/api/health` | `{ "status": "ok", "version": "0.2.0" }` (no auth required) |
 | GET | `/api/setup/status` | `SetupStatus` |
-| POST | `/api/setup/pull-model` | body `{ "model": "qwen2.5-coder:7b" }` (optional, defaults to configured) → `PullStatus` |
+| POST | `/api/setup/pull-model` | body `{ "model": "mimo-v2.6:9b-q4_K_M" }` (optional, defaults to configured) → `PullStatus` |
 | GET | `/api/setup/pull-status` | `PullStatus` |
 
 ```ts
@@ -72,7 +72,7 @@ interface SetupStatus {
   checks: SetupCheck[];
   ollama_installed: boolean;            // Ollama is on this computer (the backend starts it when stopped)
   ollama_install: InstallStep[];        // not installed: how to install it; installed: how to start it by hand
-  model_install: InstallStep[];         // e.g. `ollama pull qwen2.5-coder:7b`
+  model_install: InstallStep[];         // e.g. `ollama pull mimo-v2.6:9b-q4_K_M`
   cloud_fallback: false;                // LocPilot never falls back to cloud APIs
   checked_at: string;
 }
@@ -92,11 +92,20 @@ the model; LocPilot itself never downloads models and the installer never bundle
 
 ```ts
 interface ModelInfo { name: string; size_bytes: number | null; parameter_size: string | null;
-  quantization: string | null; family: string | null }
+  quantization: string | null; family: string | null;
+  capabilities: string[] | null;   // e.g. ["completion", "thinking"]; null on Ollama versions that don't say
+  modified_at: string | null }
 interface ModelStatus { ollama_reachable: boolean; ollama_version: string | null; ollama_url: string;
   configured_model: string; model_available: boolean; models: ModelInfo[]; num_ctx: number;
-  temperature: number; error: string | null; hint: string | null }
+  temperature: number; error: string | null; hint: string | null;
+  switched_from: string | null }   // the missing model LocPilot replaced with this installed one, if it did
 ```
+
+If the configured model is not installed but other chat models are, `GET /api/model/status`,
+`GET /api/setup/status` and starting a task switch to the best installed one (the largest that fits in
+half the RAM; embedding-only models are skipped) and save it as the model setting. Not while a download
+started from the setup screen is running. Choosing a model with `PUT /api/model/config` clears
+`switched_from`.
 
 ### Repositories
 

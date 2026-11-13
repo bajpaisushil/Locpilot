@@ -79,6 +79,8 @@ export interface ModelStatus {
   temperature: number
   error: string | null
   hint: string | null
+  /** The configured model that was missing, when LocPilot switched to this installed one by itself. */
+  switched_from?: string | null
 }
 
 export interface ModelConfigUpdate {

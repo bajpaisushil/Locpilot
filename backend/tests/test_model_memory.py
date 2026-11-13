@@ -33,12 +33,14 @@ H = {"X-LocPilot-Client": "1"}
 class RunningOllama:
     """An Ollama the user runs themselves (like `brew services start ollama`): not LocPilot's to stop."""
 
-    def __init__(self, tmp_path: Path, preloaded: str = "") -> None:
+    def __init__(self, tmp_path: Path, preloaded: str = "", models: list[dict] | None = None,
+                 **extra_env: str) -> None:
         self.url = f"http://127.0.0.1:{free_port()}"
         self.record = tmp_path / "requests.jsonl"
         self.binary = make_fake_ollama(tmp_path)
         env = {**os.environ, "OLLAMA_HOST": ollama_host_value(self.url), "FAKE_OLLAMA_RECORD": str(self.record),
-               "FAKE_OLLAMA_LOADED": preloaded}
+               "FAKE_OLLAMA_LOADED": preloaded, "FAKE_OLLAMA_MODELS": json.dumps(models) if models else "",
+               **extra_env}
         self.proc = subprocess.Popen([str(self.binary), "serve"], env=env, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + 20
@@ -78,11 +80,11 @@ async def test_quitting_locpilot_frees_the_model_it_loaded(settings, ollama):
         result = await app.state.llm_factory().chat([{"role": "user", "content": "hi"}], max_tokens=8)
         assert result.content == "ok"
         assert ollama.requests("/api/chat")[-1]["keep_alive"] == "10m"  # the configured idle timeout
-        assert set(ollama.loaded()) == {"llama3.2:3b", "qwen2.5-coder:7b"}
+        assert set(ollama.loaded()) == {"llama3.2:3b", "mimo-v2.6:9b-q4_K_M"}
         assert not app.state.ollama_launcher.owns_process
     finally:
         await stop_app(client, cm)
-    assert {"path": "/api/generate", "model": "qwen2.5-coder:7b", "keep_alive": 0} in ollama.requests("/api/generate")
+    assert [(r["model"], r["keep_alive"]) for r in ollama.requests("/api/generate")] == [("mimo-v2.6:9b-q4_K_M", 0)]
     # Only LocPilot's model is freed; the other program's model and the user's Ollama keep running.
     assert ollama.loaded() == ["llama3.2:3b"]
     assert ollama.proc.poll() is None
@@ -104,10 +106,10 @@ async def test_switching_models_frees_the_previous_one(settings, ollama):
                                         ollama_path=ollama.binary)
     try:
         await app.state.llm_factory().chat([{"role": "user", "content": "hi"}], max_tokens=8)
-        assert "qwen2.5-coder:7b" in ollama.loaded()
+        assert "mimo-v2.6:9b-q4_K_M" in ollama.loaded()
         r = await client.put("/api/model/config", json={"model": "llama3.2:3b"}, headers=H)
         assert r.status_code == 200 and r.json()["configured_model"] == "llama3.2:3b"
-        assert "qwen2.5-coder:7b" not in ollama.loaded()
+        assert "mimo-v2.6:9b-q4_K_M" not in ollama.loaded()
         await app.state.llm_factory().chat([{"role": "user", "content": "hi"}], max_tokens=8)
     finally:
         await stop_app(client, cm)

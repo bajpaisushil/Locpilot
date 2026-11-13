@@ -68,6 +68,22 @@ from locpilot.tools.patch import (
 )
 from locpilot.tools.symbols import get_symbol_index
 
+# Steps where a thinking model reasons before answering when Settings.thinking is "auto": finding the root cause
+# and explaining a failed verification. The other steps format, classify or copy and gain little from it.
+THINKING_STEPS = frozenset({"analyze", "diagnose"})
+
+
+def new_test_file(path: str) -> str:
+    """The regression test file doesn't exist yet: how to create it, with the exact block to write.
+
+    Without this, models dropped the imports or swapped the SEARCH and REPLACE halves. Only this step shows the
+    template: in the edit rules every step shares, it changed how a 7B model wrote ordinary fixes.
+    """
+    return (f"### {path}\n(new file) Create it with one block: an empty SEARCH section, then the complete file after "
+            "the ======= line, starting with the imports of the test framework and of the code under test:\n"
+            f"{path}\n<<<<<<< SEARCH\n=======\n<the complete test file>\n>>>>>>> REPLACE")
+
+
 # Keys that survive from one turn to the next.
 PERSISTENT_KEYS = ("task_id", "repo_id", "repo_path", "worktree_path", "base_commit", "history", "report",
                    "plan", "evidence", "notes", "overview", "approved_commands", "last_runs", "applied_patch_ids",
@@ -286,11 +302,14 @@ class LocPilotGraph:
     def index(self, state: AgentState) -> RepoIndex:
         return get_index(Path(state["workspace_path"]))
 
-    def _debug(self, state: AgentState, step: str, messages: list[dict], outputs: list[str]) -> None:
+    def _debug(self, state: AgentState, step: str, messages: list[dict], outputs: list[str],
+               thinking: list[str] | None = None) -> None:
         if not self.settings.debug_llm:
             return
         record = {"ts": now_iso(), "task": state["task_id"], "turn": state["turn"], "step": step,
                   "prompt": messages[-1]["content"], "outputs": outputs}
+        if thinking and any(thinking):
+            record["thinking"] = thinking
         with open(self.settings.logs_dir / "llm-debug.jsonl", "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
 
@@ -303,6 +322,11 @@ class LocPilotGraph:
                 "prompt_tokens": state.get("prompt_tokens", 0) + sum(r.prompt_tokens for r in results),
                 "completion_tokens": state.get("completion_tokens", 0) + sum(r.completion_tokens for r in results)}
 
+    def _think(self, step: str) -> bool:
+        """Whether a thinking model reasons before answering in this step (see Settings.thinking)."""
+        mode = self.settings.thinking
+        return mode == "on" or (mode == "auto" and step in THINKING_STEPS)
+
     async def llm_json(self, state: AgentState, step: str, user: str, model_cls, max_tokens: int):
         self._budget(state)
         client: LLMClient = self.deps.llm()
@@ -313,12 +337,13 @@ class LocPilotGraph:
 
         messages = [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": user}]
         try:
-            obj, results = await chat_json(client, messages, model_cls, max_tokens=max_tokens, on_progress=progress)
+            obj, results = await chat_json(client, messages, model_cls, max_tokens=max_tokens, on_progress=progress,
+                                           think=self._think(step))
         except LLMResponseError as exc:
             self._debug(state, step, messages, [f"ERROR: {exc}"])
             await self.emit(state, "llm", {"step": step, "state": "failed", "model": client.model})
             raise
-        self._debug(state, step, messages, [r.content for r in results])
+        self._debug(state, step, messages, [r.content for r in results], [r.thinking for r in results])
         await self.emit(state, "llm", {
             "step": step, "state": "completed", "model": client.model,
             "prompt_tokens": sum(r.prompt_tokens for r in results),
@@ -334,8 +359,8 @@ class LocPilotGraph:
         async def progress(tokens: int) -> None:
             await self.emit(state, "llm_progress", {"step": step, "tokens": tokens}, persist=False)
 
-        result = await client.chat(messages, max_tokens=max_tokens, on_progress=progress)
-        self._debug(state, step, messages, [result.content])
+        result = await client.chat(messages, max_tokens=max_tokens, on_progress=progress, think=self._think(step))
+        self._debug(state, step, messages, [result.content], [result.thinking])
         await self.emit(state, "llm", {"step": step, "state": "completed", "model": client.model,
                                        "prompt_tokens": result.prompt_tokens,
                                        "completion_tokens": result.completion_tokens,
@@ -764,11 +789,14 @@ class LocPilotGraph:
             if attempt + 1 < attempts and local_state["llm_calls"] < self.settings.max_llm_calls:
                 await self.log(state, f"Edit validation failed ({'; '.join(errors)[:300]}); asking the model to "
                                       "correct it.", "warning")
+                new_files = sorted(a for a in allowed_new if not (workspace / a).exists())
+                create_hint = "".join(f"\nTo create {p}, the block must be exactly:\n{p}\n<<<<<<< SEARCH\n=======\n"
+                                      "<the whole file content>\n>>>>>>> REPLACE" for p in new_files[:2])
                 messages = messages + [
                     {"role": "assistant", "content": result.content[:6000]},
                     {"role": "user", "content": "Those edits could not be applied:\n- " + "\n- ".join(errors[:8]) +
                                                 "\nReply again with corrected SEARCH/REPLACE blocks only. Copy SEARCH "
-                                                "lines exactly from the file contents shown."},
+                                                "lines exactly from the file contents shown." + create_hint},
                 ]
             else:
                 break
@@ -870,9 +898,8 @@ class LocPilotGraph:
                 test_prompt = prompts.EDIT_TEST.format(
                     request=state["request"], problem=report.get("problem_summary", ""),
                     root_cause=report.get("most_likely_root_cause") or "",
-                    fix_diff=fix_diff, test_file_state="(existing — append a new test)" if exists else
-                    "(does not exist yet — create it with an empty SEARCH section)",
-                    test_file=self._file_block(index, test_path) if exists else f"### {test_path}\n(new file)",
+                    fix_diff=fix_diff, test_file_state="(existing — append a new test)" if exists else "(does not exist yet)",
+                    test_file=self._file_block(index, test_path) if exists else new_test_file(test_path),
                     example_test=example or "(no existing tests found)", test_path=test_path,
                     code_context=code_context, spec="{spec}",
                     framework=framework, rules=prompts.EDIT_RULES.format(example_path=test_path))

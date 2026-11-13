@@ -46,6 +46,7 @@ class EditBlock:
     path: str
     search: str
     replace: str
+    divider: bool = True  # False: the ======= line was missing; only usable as the content of a new file
 
 
 @dataclass
@@ -126,12 +127,23 @@ def parse_edit_blocks(text: str) -> tuple[list[EditBlock], list[str]]:
         path = path or last_path
         j = i + 1
         search_lines: list[str] = []
-        while j < len(lines) and not _DIVIDER.match(lines[j]):
+        while j < len(lines) and not _DIVIDER.match(lines[j]) and not _TAIL.match(lines[j]):
             search_lines.append(lines[j])
             j += 1
         if j >= len(lines):
             problems.append("unterminated SEARCH block (missing =======)")
             break
+        if _TAIL.match(lines[j]):
+            # No ======= line. build_patch accepts the lines only as the content of a file that doesn't exist yet.
+            if path is None:
+                problems.append("edit block without a file path")
+            elif not any(line.strip() for line in search_lines):
+                problems.append(f"{path}: empty edit block (no ======= line and no content)")
+            else:
+                blocks.append(EditBlock(path, "\n".join(search_lines), "", divider=False))
+                last_path = path
+            i = j + 1
+            continue
         k = j + 1
         replace_lines: list[str] = []
         while k < len(lines) and not _TAIL.match(lines[k]):
@@ -210,6 +222,10 @@ def apply_edit(content: str | None, search: str, replace: str) -> str:
             return _ensure_newline(replace)
         return _ensure_newline(content) + ("\n" if not content.endswith("\n\n") else "") + _ensure_newline(replace)
     if content is None:
+        if not replace.strip():
+            # Creating a file with its content in the SEARCH half: there is nothing to search in a file that
+            # doesn't exist, so the lines can only be the new content (some models swap the halves).
+            return _ensure_newline(search)
         raise EditError("file does not exist, so SEARCH must be empty to create it")
 
     count = content.count(search)
@@ -373,11 +389,19 @@ def build_patch(root: Path, blocks: list[EditBlock], *, allowed_new_files: set[s
         working = current.replace("\r\n", "\n") if current is not None else None
         try:
             for block in grouped[rel]:
+                if not block.divider:
+                    if working is not None:
+                        raise EditError("the ======= line between SEARCH and REPLACE is missing")
+                    working = _ensure_newline(block.search.replace("\r\n", "\n"))  # a new file's content
+                    continue
                 working = apply_edit(working, block.search.replace("\r\n", "\n"), block.replace.replace("\r\n", "\n"))
         except EditError as exc:
             result.errors.append(f"{rel}: {exc}")
             continue
         assert working is not None
+        if original_disk is None and not working.strip() and rel.rsplit("/", 1)[-1] != "__init__.py":
+            result.errors.append(f"{rel}: the new file would be empty; put its whole content after the ======= line")
+            continue
         after = working.replace("\n", "\r\n") if uses_crlf else working
         if original_disk is not None and after == original_disk:
             result.warnings.append(f"{rel}: edit produced no change")

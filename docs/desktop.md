@@ -80,7 +80,7 @@ model status pill) polls `/api/setup/status` every 3 s until everything required
   steps only when it is installed but could not be started (with the reason). A Linux systemd install is
   never started as the user (it has its own model folder); the screen asks for `sudo systemctl start ollama`.
   `LOCPILOT_AUTOSTART_OLLAMA=false` turns this off; `LOCPILOT_OLLAMA_PATH` names a non-standard binary.
-- **Model** (default `qwen2.5-coder:7b`): installed or not. Users can copy `ollama pull <model>` or
+- **Model** (default `mimo-v2.6:9b-q4_K_M`): installed or not. Users can copy `ollama pull <model>` or
   click **Download <model> with Ollama**, which asks the local Ollama daemon to pull the model and shows
   live progress. They can also switch to a model that is already installed.
 - **Git** (required) and the **test-command sandbox** (informational).

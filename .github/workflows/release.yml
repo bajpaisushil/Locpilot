@@ -162,7 +162,7 @@ jobs:
             Local-first AI software engineering agent (Tauri desktop app with a bundled Python agent).
 
             **Before first launch:** install [Ollama](https://ollama.com/download) and pull a model
-            (default `qwen2.5-coder:7b`). LocPilot guides you through this on first run and works
+            (default `mimo-v2.6:9b-q4_K_M`). LocPilot guides you through this on first run and works
             offline afterwards. LocPilot never falls back to cloud AI APIs.
 
             Unsigned builds: see docs/desktop.md for Gatekeeper / SmartScreen instructions.

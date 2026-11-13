@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterable
@@ -58,13 +59,15 @@ class LLMResult:
     duration_ms: int
     model: str
     truncated: bool = False
+    thinking: str = ""  # the model's reasoning before the answer (thinking models with think=True)
 
 
 class LLMClient(Protocol):
     model: str
 
     async def chat(self, messages: list[dict], *, schema: dict | None = None, max_tokens: int = 1024,
-                   on_progress: ProgressCallback | None = None, temperature: float | None = None) -> LLMResult: ...
+                   on_progress: ProgressCallback | None = None, temperature: float | None = None,
+                   think: bool = False) -> LLMResult: ...
 
 
 def inline_refs(schema: dict) -> dict:
@@ -106,6 +109,57 @@ def extract_json(text: str) -> Any:
         raise
 
 
+def physical_memory() -> int | None:
+    """Installed RAM in bytes, or None where it can't be read (Windows)."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def pick_installed_model(models: list[dict], ram_bytes: int | None) -> str | None:
+    """The installed chat model to use when the configured one isn't installed.
+
+    Embedding-only models are skipped. Prefers the largest model that fits comfortably in memory (file size at most
+    half the RAM, leaving room for the context and other apps), else the smallest one; without a RAM figure, the most
+    recently downloaded one.
+    """
+    def chats(m: dict) -> bool:
+        caps = m.get("capabilities")
+        if caps is not None:
+            return "completion" in caps
+        return "embed" not in str(m.get("name")).lower()  # older Ollama doesn't report capabilities
+
+    candidates = [m for m in models if m.get("name") and chats(m)]
+    if not candidates:
+        return None
+    limit = ram_bytes / 2 if ram_bytes else None
+
+    def rank(m: dict) -> tuple:
+        size = m.get("size_bytes") or 0
+        if limit is None:
+            return (0, 0, m.get("modified_at") or "")
+        fits = size <= limit
+        return (fits, size if fits else -size, m.get("modified_at") or "")
+
+    return max(candidates, key=rank)["name"]
+
+
+def reasoning_in_circles(text: str, window: int = 300) -> bool:
+    """True when the reasoning keeps repeating itself: its last ``window`` characters already occurred twice before.
+
+    Small thinking models sometimes loop over the same few sentences until their budget runs out; more of that
+    never produces an answer. Quoting the same code once more doesn't count, a third repetition does.
+    """
+    if len(text) < 3 * window:
+        return False
+    return text.count(text[-window:]) >= 3
+
+
+# Model capabilities ("completion", "thinking", "tools", …) per (Ollama URL, model), read once per run.
+_capabilities_cache: dict[tuple[str, str], frozenset[str]] = {}
+
+
 def setup_hint(base_url: str, model: str) -> str:
     return (f"Start Ollama (open the Ollama app or run `ollama serve`) so it listens on {base_url}, "
             f"then download the model with `ollama pull {model}`.")
@@ -114,7 +168,7 @@ def setup_hint(base_url: str, model: str) -> str:
 class OllamaClient:
     def __init__(self, base_url: str, model: str, *, num_ctx: int = 16384, temperature: float = 0.1,
                  timeout_s: float = 900.0, seed: int | None = 7, allow_remote: bool = False,
-                 keep_alive: str = "30m", usage: ModelUsage | None = None) -> None:
+                 keep_alive: str = "30m", usage: ModelUsage | None = None, thinking_tokens: int = 4096) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.num_ctx = num_ctx
@@ -124,6 +178,7 @@ class OllamaClient:
         self.allow_remote = allow_remote
         self.keep_alive = keep_alive  # how long Ollama keeps the model in RAM after the last request
         self.usage = usage
+        self.thinking_tokens = thinking_tokens  # extra output budget for the reasoning when think=True
 
     def _check_local(self) -> None:
         if not self.allow_remote and not ollama_url_is_local(self.base_url):
@@ -149,13 +204,33 @@ class OllamaClient:
                 details = m.get("details") or {}
                 models.append({"name": m.get("name") or m.get("model"), "size_bytes": m.get("size"),
                                "parameter_size": details.get("parameter_size"),
-                               "quantization": details.get("quantization_level"), "family": details.get("family")})
+                               "quantization": details.get("quantization_level"), "family": details.get("family"),
+                               "capabilities": m.get("capabilities"), "modified_at": m.get("modified_at")})
             return models
 
     @staticmethod
     def model_installed(model: str, names: list[str]) -> bool:
         candidates = {model, model if ":" in model else f"{model}:latest"}
         return any(n in candidates for n in names)
+
+    async def capabilities(self) -> frozenset[str] | None:
+        """What the model can do (e.g. "thinking"), or None when Ollama doesn't say (older versions, errors)."""
+        key = (self.base_url, self.model)
+        if key in _capabilities_cache:
+            return _capabilities_cache[key]
+        self._check_local()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                resp = await client.post(f"{self.base_url}/api/show", json={"model": self.model})
+                resp.raise_for_status()
+                caps = resp.json().get("capabilities")
+        except (httpx.HTTPError, ValueError) as exc:
+            log.info("could not read the capabilities of %s: %s", self.model, exc)
+            return None
+        if not isinstance(caps, list):
+            return None
+        _capabilities_cache[key] = frozenset(str(c) for c in caps)
+        return _capabilities_cache[key]
 
     async def loaded_models(self) -> list[str]:
         """Models Ollama currently holds in memory."""
@@ -234,9 +309,35 @@ class OllamaClient:
             usage.loaded.add(self.model)
 
     async def chat(self, messages: list[dict], *, schema: dict | None = None, max_tokens: int = 1024,
-                   on_progress: ProgressCallback | None = None, temperature: float | None = None) -> LLMResult:
+                   on_progress: ProgressCallback | None = None, temperature: float | None = None,
+                   think: bool = False) -> LLMResult:
+        """One model call. ``think`` lets a thinking model reason first; for other models it is ignored.
+
+        Thinking models think by default, so they get an explicit ``think`` either way. The reasoning gets its own
+        ``thinking_tokens`` budget on top of the answer's. If the model spends all of it, or goes in circles,
+        without answering, the reasoning is cut off and the call is repeated once without thinking.
+        """
         self._check_local()
         await self._note_usage()
+        caps = await self.capabilities()
+        if caps is None or "thinking" not in caps:
+            return await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=None)
+        if not think:
+            return await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=False)
+        result = await self._chat_once(messages, schema, max_tokens + self.thinking_tokens, on_progress, temperature,
+                                       think=True, thinking_budget=self.thinking_tokens)
+        if result.content.strip() or not result.truncated:
+            return result
+        log.info("%s gave no answer after reasoning; asking again without thinking", self.model)
+        retry = await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=False)
+        return LLMResult(content=retry.content, prompt_tokens=result.prompt_tokens + retry.prompt_tokens,
+                         completion_tokens=result.completion_tokens + retry.completion_tokens,
+                         duration_ms=result.duration_ms + retry.duration_ms, model=self.model,
+                         truncated=retry.truncated, thinking=result.thinking)
+
+    async def _chat_once(self, messages: list[dict], schema: dict | None, max_tokens: int,
+                         on_progress: ProgressCallback | None, temperature: float | None, *,
+                         think: bool | None, thinking_budget: int | None = None) -> LLMResult:
         options: dict[str, Any] = {"num_ctx": self.num_ctx, "num_predict": max_tokens, "top_p": 0.9,
                                    "temperature": self.temperature if temperature is None else temperature}
         if self.seed is not None:
@@ -245,12 +346,16 @@ class OllamaClient:
                                    "keep_alive": self.keep_alive, "options": options}
         if schema is not None:
             payload["format"] = schema
+        if think is not None:
+            payload["think"] = think
         timeout = httpx.Timeout(connect=5.0, read=self.timeout_s, write=60.0, pool=5.0)
         start = time.monotonic()
         parts: list[str] = []
-        chunks = 0
+        thoughts: list[str] = []
+        chunks = thought_chunks = 0  # streamed pieces (about one token each)
         prompt_tokens = completion_tokens = 0
         done_reason = None
+        cut_off = ""  # why the reasoning was stopped before any answer
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as resp:
@@ -266,12 +371,24 @@ class OllamaClient:
                         chunk = json.loads(line)
                         if chunk.get("error"):
                             raise LLMResponseError(f"Ollama error: {chunk['error']}")
-                        piece = (chunk.get("message") or {}).get("content") or ""
+                        message = chunk.get("message") or {}
+                        piece, thought = message.get("content") or "", message.get("thinking") or ""
                         if piece:
                             parts.append(piece)
+                        if thought:
+                            thoughts.append(thought)
+                        if piece or thought:  # reasoning is progress too: the UI shows the model is working
                             chunks += 1
                             if on_progress is not None and chunks % 16 == 0:
                                 await on_progress(chunks)
+                        if thought and thinking_budget is not None and not parts:
+                            thought_chunks += 1
+                            if thought_chunks >= thinking_budget:
+                                cut_off = f"used its whole reasoning budget ({thinking_budget} tokens)"
+                            elif thought_chunks % 16 == 0 and reasoning_in_circles("".join(thoughts)):
+                                cut_off = f"was reasoning in circles after {thought_chunks} tokens"
+                            if cut_off:
+                                break  # closing the stream makes Ollama stop generating
                         if chunk.get("done"):
                             prompt_tokens = int(chunk.get("prompt_eval_count") or 0)
                             completion_tokens = int(chunk.get("eval_count") or chunks)
@@ -281,9 +398,12 @@ class OllamaClient:
                                       setup_hint(self.base_url, self.model)) from exc
         except httpx.TimeoutException as exc:
             raise LLMResponseError(f"Ollama did not respond within {self.timeout_s:.0f}s") from exc
+        if cut_off:
+            log.info("%s %s without answering", self.model, cut_off)
+            completion_tokens = chunks
         return LLMResult(content="".join(parts), prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                          duration_ms=int((time.monotonic() - start) * 1000), model=self.model,
-                         truncated=done_reason == "length")
+                         truncated=bool(cut_off) or done_reason == "length", thinking="".join(thoughts))
 
     async def pull(self, model: str, on_update: Callable[[dict], Awaitable[None]]) -> None:
         """Ask the local Ollama daemon to download a model (explicit user action from the setup screen)."""
@@ -312,14 +432,16 @@ class OllamaClient:
 
 
 async def chat_json(client: LLMClient, messages: list[dict], model_cls: type[T], *, max_tokens: int,
-                    on_progress: ProgressCallback | None = None, retries: int = 1) -> tuple[T, list[LLMResult]]:
+                    on_progress: ProgressCallback | None = None, retries: int = 1,
+                    think: bool = False) -> tuple[T, list[LLMResult]]:
     """Structured output with schema-constrained decoding, validation and one repair retry."""
     schema = inline_refs(model_cls.model_json_schema())
     results: list[LLMResult] = []
     convo = list(messages)
     last_error = ""
     for _attempt in range(retries + 1):
-        result = await client.chat(convo, schema=schema, max_tokens=max_tokens, on_progress=on_progress)
+        result = await client.chat(convo, schema=schema, max_tokens=max_tokens, on_progress=on_progress,
+                                   think=think)
         results.append(result)
         try:
             data = extract_json(result.content)

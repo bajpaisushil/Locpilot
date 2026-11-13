@@ -28,7 +28,7 @@ export function ModelStatusPill() {
     } else {
       tone = 'bg-success'
       text = model.data.configured_model
-      hint = `Local inference via Ollama ${model.data.ollama_version ?? ''} · context ${model.data.num_ctx} tokens`
+      hint = `${text} — local inference via Ollama ${model.data.ollama_version ?? ''} · context ${model.data.num_ctx} tokens`
     }
   }
   return (
@@ -37,11 +37,13 @@ export function ModelStatusPill() {
         type="button"
         onClick={() => setSetupOpen(true)}
         className="inline-flex h-7 items-center gap-1.5 rounded-full border bg-background/60 px-2.5 text-xs transition-colors hover:bg-accent"
+        aria-label={text}
         data-testid="model-status-pill"
       >
-        <span className={cn('size-1.5 rounded-full', tone)} aria-hidden />
-        <CpuIcon className="size-3.5 text-muted-foreground" />
-        <span className="max-w-44 truncate font-mono text-[11px]">{text}</span>
+        <span className={cn('size-1.5 shrink-0 rounded-full', tone)} aria-hidden />
+        <CpuIcon className="size-3.5 shrink-0 text-muted-foreground" />
+        {/* With the side panel open the header is narrow: then only the dot shows (the name is in the hint). */}
+        <span className="hidden max-w-44 truncate font-mono text-[11px] @min-[560px]:block">{text}</span>
       </button>
     </Hint>
   )
@@ -56,26 +58,32 @@ export function TopBar() {
   const task = useTask(taskId)
   const st = repo.data?.status
   const changes = st ? st.staged + st.modified + st.untracked + st.conflicted : 0
+  const branch = st?.detached ? `detached ${st.head?.slice(0, 7) ?? ''}` : (st?.branch ?? '—')
 
   return (
-    <header className="flex h-12 shrink-0 items-center gap-3 border-b px-4" data-tauri-drag-region>
-      <div className="flex min-w-0 flex-1 items-center gap-2">
+    <header className="@container flex h-12 shrink-0 items-center gap-3 border-b px-4" data-tauri-drag-region>
+      {/* The task title shrinks first. In a very narrow header (side panel open on a small window) the branch shows
+          only its icon and the repo name truncates too; overflow-hidden keeps anything from covering the model pill. */}
+      <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
         {repo.data ? (
           <>
-            <span className="max-w-[18ch] shrink-0 truncate text-sm font-medium" title={repo.data.path}>
+            <span
+              className="max-w-[18ch] shrink-0 truncate text-sm font-medium @max-[460px]:min-w-[3ch] @max-[460px]:shrink"
+              title={repo.data.path}
+            >
               {repo.data.name}
             </span>
             {st && (
               <Hint
-                label={
+                label={`${branch} — ${
                   st.dirty
                     ? `${changes} uncommitted change${changes === 1 ? '' : 's'} in your working tree (LocPilot never modifies them)`
-                    : 'Working tree clean'
-                }
+                    : 'working tree clean'
+                }`}
               >
                 <span className="inline-flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
                   <GitBranchIcon className="size-3" />
-                  {st.detached ? `detached ${st.head?.slice(0, 7) ?? ''}` : (st.branch ?? '—')}
+                  <span className="@max-[460px]:hidden">{branch}</span>
                   {st.dirty && <span className="size-1.5 rounded-full bg-warning" aria-label="uncommitted changes" />}
                   {(st.ahead > 0 || st.behind > 0) && (
                     <span className="text-[10px]">

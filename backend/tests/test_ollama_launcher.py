@@ -1,8 +1,8 @@
 """Starting an installed-but-stopped Ollama, and what the setup screen says when it can't.
 
 A fake ``ollama`` executable stands in for the real one: ``ollama serve`` runs a tiny HTTP server on
-``OLLAMA_HOST`` (exactly where LocPilot connects) that answers version, model list, loaded models, chat
-and unload requests, and can record the POST requests it gets.
+``OLLAMA_HOST`` (exactly where LocPilot connects) that answers version, model list, model capabilities,
+loaded models, chat (with or without thinking) and unload requests, and can record the POST requests it gets.
 """
 
 from __future__ import annotations
@@ -38,6 +38,12 @@ host, _, port = os.environ["OLLAMA_HOST"].rpartition(":")
 leaked = sorted(k for k in os.environ if k.upper().startswith("LOCPILOT_"))
 record = os.environ.get("FAKE_OLLAMA_RECORD")
 loaded = [m for m in os.environ.get("FAKE_OLLAMA_LOADED", "").split(",") if m]  # models in "RAM"
+# Installed models; "capabilities" is optional (older Ollama versions don't report it).
+models = json.loads(os.environ.get("FAKE_OLLAMA_MODELS") or "null") or [
+    {"name": n, "size": 4_700_000_000} for n in ("mimo-v2.6:9b-q4_K_M", "llama3.2:3b")]
+think_forever = os.environ.get("FAKE_OLLAMA_THINK_FOREVER") == "1"  # thinking never ends within the budget
+# Reasoning a thinking model streams (one token per piece) before it answers "ok", as far as num_predict allows.
+reasoning = json.loads(os.environ.get("FAKE_OLLAMA_REASONING") or "null")
 lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
@@ -53,8 +59,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/version":
             self.reply({"version": "0.0.0-fake", "leaked_env": leaked})
         elif self.path == "/api/tags":
-            self.reply({"models": [{"name": n, "size": 4_700_000_000, "details": {}}
-                                   for n in ("qwen2.5-coder:7b", "llama3.2:3b")]})
+            self.reply({"models": [{**m, "details": {}} for m in models]})
         elif self.path == "/api/ps":
             with lock:
                 self.reply({"models": [{"name": m, "model": m} for m in loaded]})
@@ -67,7 +72,16 @@ class Handler(BaseHTTPRequestHandler):
         if record:
             with lock, open(record, "a") as fh:
                 fh.write(json.dumps({"path": self.path, "model": body.get("model"),
-                                     "keep_alive": body.get("keep_alive")}) + "\n")
+                                     "keep_alive": body.get("keep_alive"), "think": body.get("think", "unset"),
+                                     "num_predict": (body.get("options") or {}).get("num_predict")}) + "\n")
+        if self.path == "/api/show":
+            info = next((m for m in models if m["name"] == body.get("model")), None)
+            if info is None:
+                self.send_response(404)
+                self.end_headers()
+            else:
+                self.reply({k: v for k, v in info.items() if k == "capabilities"})
+            return
         with lock:
             if self.path == "/api/generate" and body.get("keep_alive") == 0:
                 if body.get("model") in loaded:
@@ -75,7 +89,22 @@ class Handler(BaseHTTPRequestHandler):
             elif body.get("model") not in loaded:
                 loaded.append(body["model"])  # a chat (or load) request puts the model in memory
         if self.path == "/api/chat":
-            self.reply([{"message": {"content": "ok"}, "done": False},
+            if body.get("think") is True and think_forever:
+                self.reply([{"message": {"content": "", "thinking": "hmm "}, "done": False},
+                            {"done": True, "prompt_eval_count": 3, "eval_count": 9, "done_reason": "length"}],
+                           ndjson=True)
+                return
+            if body.get("think") is True and reasoning is not None:
+                limit = (body.get("options") or {}).get("num_predict") or len(reasoning)
+                pieces = [{"message": {"content": "", "thinking": t}, "done": False} for t in reasoning[:limit]]
+                end = ([{"done": True, "prompt_eval_count": 3, "eval_count": limit, "done_reason": "length"}]
+                       if len(reasoning) >= limit else
+                       [{"message": {"content": "ok"}, "done": False},
+                        {"done": True, "prompt_eval_count": 3, "eval_count": len(pieces) + 1, "done_reason": "stop"}])
+                self.reply([*pieces, *end], ndjson=True)
+                return
+            thought = [{"message": {"content": "", "thinking": "let me see"}, "done": False}] if body.get("think") else []
+            self.reply([*thought, {"message": {"content": "ok"}, "done": False},
                         {"done": True, "prompt_eval_count": 3, "eval_count": 1, "done_reason": "stop"}], ndjson=True)
         else:
             self.reply({"model": body.get("model"), "done": True})

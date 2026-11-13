@@ -23,24 +23,47 @@ LocPilot stops again when it quits. So:
 
 ## "Model … is not installed"
 
-* `ollama pull qwen2.5-coder:7b` (≈4.7 GB), or press **Download model** on the setup
+* `ollama pull mimo-v2.6:9b-q4_K_M` (≈6.6 GB), or press **Download model** on the setup
   screen (the local Ollama daemon downloads it; progress is shown).
 * Prefer another model? `ollama list`, then choose it in **Settings** (or set
-  `LOCPILOT_MODEL`). Code-tuned models of 7B+ parameters work best; smaller models
+  `LOCPILOT_MODEL`). Models of 7B+ parameters work best; smaller models
   produce weaker analyses and patches.
+* You only see this when **no** chat model is installed. If the configured model is missing
+  but you installed another one yourself (`ollama pull …`), LocPilot switches to it by itself
+  (the largest installed chat model that fits in half your RAM; embedding-only models are
+  skipped), remembers it, and says so on the setup screen and in Settings.
+
+## Thinking models (MiMo, Qwen3, …)
+
+Some models can reason before they answer ("thinking"), and they do so by default. LocPilot
+tells them explicitly, per step, whether to think: `LOCPILOT_THINKING=off` (default) never,
+`auto` only in the root-cause analysis and failure diagnosis, `on` in every step. With the
+default model, `auto` made each benchmark fix about 1.5× slower without fixing more bugs (see
+[benchmark results](benchmark-results.md)), so thinking is off unless you turn it on. When on,
+the reasoning gets its own token budget (`LOCPILOT_THINKING_TOKENS`, default 4096) so it cannot
+crowd out the answer. If a model is still thinking when the budget runs out, or keeps repeating
+the same sentences (small models sometimes reason in circles), LocPilot cuts the reasoning off
+and asks again without thinking. Reasoning is slow on a laptop: about 10 tokens per second for
+the default model on an M4, so a full budget costs several minutes per step. Models that
+cannot think ignore the setting. With `LOCPILOT_DEBUG_LLM=true`, the reasoning is written to
+`~/.locpilot/logs/llm-debug.jsonl` next to the prompts and answers.
 
 ## Not enough RAM / very slow answers
 
-* `qwen2.5-coder:7b` (Q4) needs ~6–8 GB free RAM with a 16k context. Close heavy apps
-  (Docker, browsers) or lower the context: Settings → context size, or
-  `LOCPILOT_NUM_CTX=8192`.
+* The default `mimo-v2.6:9b-q4_K_M` uses about 5.8 GB of RAM with a 16k context (measured with
+  `ollama ps` on an Apple M4); leave a couple of GB more free. Close heavy apps (Docker,
+  browsers) or lower the context: Settings → context size, or `LOCPILOT_NUM_CTX=8192`.
+* On 8 GB machines, lower the context as above, or try a smaller model such as
+  `qwen2.5-coder:3b` (lower quality).
+* Expect 1–4 minutes for an Ask-mode investigation and 3–8 minutes for a Code-mode fix
+  with verification on an Apple M-series laptop.
 * First request after a while is slow because Ollama loads the model (5–60 s). LocPilot
   asks Ollama to keep it loaded for 30 minutes after the last request
   (`LOCPILOT_OLLAMA_KEEP_ALIVE`, e.g. `10m`, or `0` to unload after every request).
 
 ## Is the model using my RAM when LocPilot is closed?
 
-No. The model file (≈4.7 GB for `qwen2.5-coder:7b`) only takes disk space until Ollama
+No. The model file (≈6.6 GB for the default model) only takes disk space until Ollama
 loads it, which happens on LocPilot's first request. LocPilot frees it again:
 
 * **when LocPilot quits**: it unloads the models it loaded (or stops the `ollama serve` it
@@ -49,11 +72,8 @@ loads it, which happens on LocPilot's first request. LocPilot frees it again:
 * **when it is idle** for the keep-alive time above, Ollama unloads it by itself.
 
 An idle Ollama with no model loaded uses about 30 MB. To check or free memory by hand:
-`ollama ps` (what is loaded), `ollama stop qwen2.5-coder:7b` (unload now),
+`ollama ps` (what is loaded), `ollama stop mimo-v2.6:9b-q4_K_M` (unload now),
 `brew services stop ollama` (stop a Homebrew-run Ollama; LocPilot starts it again when needed).
-* On 8 GB machines try a smaller model such as `qwen2.5-coder:3b` (lower quality).
-* Expect 1–4 minutes for an Ask-mode investigation and 3–8 minutes for a Code-mode fix
-  with verification on an Apple M-series laptop.
 
 ## Port conflicts
 

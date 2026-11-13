@@ -142,6 +142,44 @@ def test_fenced_new_file_reply_is_accepted_only_for_allowed_new_files():
     assert parse_fenced_new_files("```python\nx = 1\n```", {"a.py", "b.py"}) == []
 
 
+def test_new_file_content_in_the_wrong_half_is_still_a_new_file(hotel_repo):
+    """Models sometimes put a new file's content in SEARCH (REPLACE empty) or drop the ======= line. With no file
+    to search in, those lines can only be the content. Never so for an existing file: that would delete code."""
+    test = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertTrue(True)"
+    new = "tests/test_regression.py"
+    swapped = f"{new}\n<<<<<<< SEARCH\n{test}\n=======\n>>>>>>> REPLACE\n"
+    no_divider = f"{new}\n<<<<<<< SEARCH\n{test}\n>>>>>>> REPLACE\n"
+    for reply in (swapped, no_divider):
+        blocks, problems = parse_edit_blocks(reply)
+        assert not problems and len(blocks) == 1
+        build = build_patch(hotel_repo, blocks, allowed_new_files={new})
+        assert build.ok and build.changes[0].change == "create"
+        assert build.changes[0].after == test + "\n"
+    existing = "offers/aggregator.py"
+    original = (hotel_repo / existing).read_text()
+    first_lines = "\n".join(original.splitlines()[:3])
+    blocks, _ = parse_edit_blocks(f"{existing}\n<<<<<<< SEARCH\n{first_lines}\n>>>>>>> REPLACE\n")
+    errors = build_patch(hotel_repo, blocks).errors
+    assert errors and "======= line" in errors[0]
+    assert (hotel_repo / existing).read_text() == original
+
+
+def test_empty_or_unfinished_blocks_explain_themselves(hotel_repo):
+    blocks, problems = parse_edit_blocks("tests/test_new.py\n<<<<<<< SEARCH\n>>>>>>> REPLACE\n")
+    assert blocks == [] and "empty edit block" in problems[0]
+    blocks, _ = parse_edit_blocks("tests/test_new.py\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\n")
+    errors = build_patch(hotel_repo, blocks, allowed_new_files={"tests/test_new.py"}).errors
+    assert errors and "would be empty" in errors[0]
+    blocks, _ = parse_edit_blocks("newpkg/__init__.py\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\n")
+    assert build_patch(hotel_repo, blocks, allowed_new_files={"newpkg/__init__.py"}).ok  # empty package marker
+    # A missing ======= in one block doesn't swallow the next block.
+    two = ("tests/test_a.py\n<<<<<<< SEARCH\nx = 1\n>>>>>>> REPLACE\n\n"
+           "tests/test_b.py\n<<<<<<< SEARCH\n=======\ny = 2\n>>>>>>> REPLACE\n")
+    blocks, problems = parse_edit_blocks(two)
+    assert not problems and [(b.path, b.divider) for b in blocks] == [("tests/test_a.py", False),
+                                                                       ("tests/test_b.py", True)]
+
+
 def test_import_resolution_for_code_context(hotel_repo, tmp_path):
     from locpilot.agent.graph import _resolve_import
 

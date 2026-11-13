@@ -34,7 +34,7 @@ def default_llm_factory(settings: Settings, db: Database,
                             temperature=settings.temperature if temperature is None else float(temperature),
                             timeout_s=settings.llm_timeout_s, seed=settings.llm_seed,
                             allow_remote=settings.allow_remote_ollama, keep_alive=settings.ollama_keep_alive,
-                            usage=usage)
+                            usage=usage, thinking_tokens=settings.thinking_tokens)
 
     return factory
 
@@ -92,6 +92,7 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     app.state.llm_factory = factory
     app.state.ollama_launcher = launcher
     app.state.model_usage = usage
+    app.state.model_switch = None  # {"from", "to"} when LocPilot replaced a missing model with an installed one
     app.state.pull = {"model": None, "state": "idle", "status_text": "", "completed": None, "total": None,
                       "error": None}
 

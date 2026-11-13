@@ -98,6 +98,7 @@ export function modelStatus(overrides: Partial<ModelStatus> = {}): ModelStatus {
     temperature: 0.1,
     error: null,
     hint: null,
+    switched_from: null,
     ...overrides,
   }
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
@@ -11,11 +12,19 @@ from locpilot import __version__
 from locpilot.api.models import ApiError, ModelConfigUpdate, PullRequest, db_of, settings_of
 from locpilot.config import platform_name
 from locpilot.llm.launcher import DEFAULT_ADDRESS, LaunchInfo, OllamaInstall, listen_address, ollama_host_value
-from locpilot.llm.ollama import MODEL_NAME_RE, LLMResponseError, LLMUnavailableError, OllamaClient
+from locpilot.llm.ollama import (
+    MODEL_NAME_RE,
+    LLMResponseError,
+    LLMUnavailableError,
+    OllamaClient,
+    physical_memory,
+    pick_installed_model,
+)
 from locpilot.security.sandbox import detect_sandbox
 from locpilot.tools import git
 
 router = APIRouter(prefix="/api")
+log = logging.getLogger("locpilot")
 
 
 @router.get("/health")
@@ -26,6 +35,33 @@ async def health() -> dict:
 async def ensure_ollama(request: Request, wait_s: float = 20.0) -> LaunchInfo:
     """Start the installed Ollama if it is not running (no-op when it runs, isn't installed, or is remote)."""
     return await request.app.state.ollama_launcher.ensure_running(wait_s=wait_s)
+
+
+async def model_status_with_fallback(request: Request) -> dict:
+    """The model status; if the configured model isn't installed but other chat models are, switch to one of them.
+
+    So a model you downloaded yourself (`ollama pull …`) is used without visiting Settings. Not while a download
+    started from the setup screen is running: that one is about to provide the configured model.
+    """
+    llm = request.app.state.llm_factory()
+    status = await llm.status()
+    if (not isinstance(llm, OllamaClient) or not status["ollama_reachable"] or status["model_available"]
+            or request.app.state.pull.get("state") == "pulling"):
+        return _with_switch(request, status)
+    pick = pick_installed_model(status["models"], physical_memory())
+    if pick is None:
+        return _with_switch(request, status)
+    db_of(request).set_setting("model", pick)
+    request.app.state.model_switch = {"from": llm.model, "to": pick}
+    log.info("model %s is not installed; using the installed model %s", llm.model, pick)
+    return _with_switch(request, await request.app.state.llm_factory().status())
+
+
+def _with_switch(request: Request, status: dict) -> dict:
+    """Adds ``switched_from``: the missing model that LocPilot replaced with the current one (this run), if any."""
+    switch = getattr(request.app.state, "model_switch", None)
+    replaced = switch["from"] if switch and switch["to"] == status.get("configured_model") else None
+    return {**status, "switched_from": replaced}
 
 
 def _step(title: str, command: str | None = None, url: str | None = None, description: str | None = None) -> dict:
@@ -124,8 +160,8 @@ async def setup_status(request: Request) -> dict:
     settings = settings_of(request)
     launcher = request.app.state.ollama_launcher
     launch = await ensure_ollama(request)
+    status = await model_status_with_fallback(request)
     llm = request.app.state.llm_factory()
-    status = await llm.status()
     install = None
     if not status["ollama_reachable"] and launch.state != "remote":
         install = launch.install or (None if launch.state == "not_installed" else launcher.installation())
@@ -138,8 +174,10 @@ async def setup_status(request: Request) -> dict:
     elif status["model_available"]:
         info = next((m for m in status["models"] if llm.model_installed(llm.model, [m["name"]])), {})
         size = f" ({info.get('size_bytes', 0) / 1e9:.1f} GB)" if info.get("size_bytes") else ""
+        why = (f" — {status['switched_from']} is not installed, so LocPilot uses this model (change it in Settings)"
+               if status.get("switched_from") else "")
         checks.append({"id": "model", "label": f"Model {llm.model}", "status": "ok", "required": True,
-                       "detail": f"{llm.model} is installed{size}", "hint": None})
+                       "detail": f"{llm.model} is installed{size}{why}", "hint": None})
     else:
         checks.append({"id": "model", "label": f"Model {llm.model}", "status": "missing", "required": True,
                        "detail": f"{llm.model} is not installed in Ollama", "hint": f"ollama pull {llm.model}"})
@@ -206,7 +244,7 @@ async def pull_model(body: PullRequest, request: Request) -> dict:
 @router.get("/model/status")
 async def model_status(request: Request) -> dict:
     await ensure_ollama(request, wait_s=10.0)
-    return await request.app.state.llm_factory().status()
+    return await model_status_with_fallback(request)
 
 
 @router.put("/model/config")
@@ -220,8 +258,9 @@ async def model_config(body: ModelConfigUpdate, request: Request) -> dict:
             # Switching models: free the old one's RAM now instead of after the idle timeout.
             usage.forget(previous.model)
             await previous.unload_models([previous.model])
+        request.app.state.model_switch = None  # the user chose; no longer LocPilot's substitute
     if body.num_ctx is not None:
         db.set_setting("num_ctx", body.num_ctx)
     if body.temperature is not None:
         db.set_setting("temperature", body.temperature)
-    return await request.app.state.llm_factory().status()
+    return _with_switch(request, await request.app.state.llm_factory().status())

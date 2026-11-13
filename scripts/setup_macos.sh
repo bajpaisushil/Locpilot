@@ -7,12 +7,12 @@
 #   scripts/setup_macos.sh                   # check tools + install project deps
 #   scripts/setup_macos.sh --install-tools   # also `brew install uv node` if missing
 #   scripts/setup_macos.sh --install-ollama  # also `brew install ollama`
-#   scripts/setup_macos.sh --pull-model      # also `ollama pull $LOCPILOT_MODEL` (~4.7 GB default)
+#   scripts/setup_macos.sh --pull-model      # also `ollama pull $LOCPILOT_MODEL` (~6.6 GB default)
 #   scripts/setup_macos.sh --with-rust       # also install Rust via rustup (needed only for desktop builds)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL="${LOCPILOT_MODEL:-qwen2.5-coder:7b}"
+MODEL="${LOCPILOT_MODEL:-mimo-v2.6:9b-q4_K_M}"
 INSTALL_TOOLS=0 INSTALL_OLLAMA=0 PULL_MODEL=0 WITH_RUST=0
 for arg in "$@"; do
   case "$arg" in

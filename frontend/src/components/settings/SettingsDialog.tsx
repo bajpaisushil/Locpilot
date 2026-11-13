@@ -135,6 +135,13 @@ export function SettingsDialog() {
                 Ollama {model.data.ollama_version ?? '(unreachable)'} at{' '}
                 <span className="font-mono">{model.data.ollama_url}</span>
                 {model.data.error && <div className="mt-1 text-warning">{model.data.error}</div>}
+                {model.data.switched_from && (
+                  <div className="mt-1" data-testid="model-switched-note">
+                    <span className="font-mono">{model.data.switched_from}</span> is not installed, so LocPilot
+                    uses <span className="font-mono">{model.data.configured_model}</span>, a model you have
+                    installed.
+                  </div>
+                )}
               </div>
               <ModelForm key={model.data.configured_model} status={model.data} />
             </>

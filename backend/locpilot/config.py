@@ -52,11 +52,17 @@ class Settings(BaseSettings):
     autostart_ollama: bool = True  # start an installed-but-stopped local Ollama (see llm/launcher.py)
     ollama_path: Path | None = None  # the ollama binary to start; default: found automatically
     ollama_start_timeout_s: float = 45.0
-    model: str = "qwen2.5-coder:7b"
+    # The explicit tag matters: on Apple Silicon, plain "mimo-v2.6:9b" is an 8.7 GB MLX build.
+    model: str = "mimo-v2.6:9b-q4_K_M"
     # How long Ollama keeps the model in RAM after LocPilot's last request ("10m", "1h", "0" = unload at once).
     # LocPilot also unloads it when LocPilot quits or you switch models.
     ollama_keep_alive: str = "30m"
     num_ctx: int = 16384
+    # Thinking models (MiMo, Qwen3, …) can reason before they answer, which they do by default. "off" tells them not
+    # to: in LocPilot's benchmark it was faster and no less accurate. "auto" thinks only in the root-cause analysis
+    # and failure diagnosis; "on" in every step. Models that cannot think ignore this.
+    thinking: Literal["auto", "on", "off"] = "off"
+    thinking_tokens: int = Field(default=4096, ge=256, le=32768)  # reasoning budget per step, on top of the answer
     temperature: float = 0.1
     llm_timeout_s: float = 900.0
     llm_seed: int = 7

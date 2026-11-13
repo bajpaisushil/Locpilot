@@ -26,6 +26,7 @@ from locpilot.api.models import (
     manager_of,
     settings_of,
 )
+from locpilot.api.setup import model_status_with_fallback
 from locpilot.llm.ollama import LLMUnavailableError
 from locpilot.security.paths import PathSecurityError, normalize_relpath
 from locpilot.storage.db import now_iso
@@ -63,6 +64,7 @@ def task_detail(request: Request, task_id: str) -> dict:
 
 async def _require_model(request: Request) -> str:
     await request.app.state.ollama_launcher.ensure_running(wait_s=30.0)  # start an installed, stopped Ollama
+    await model_status_with_fallback(request)  # use an installed model if the configured one was removed
     llm = request.app.state.llm_factory()
     try:
         await llm.ensure_ready()

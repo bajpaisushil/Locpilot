@@ -88,6 +88,7 @@ class FakeLLM:
         self.calls: list[str] = []
         self.gate: asyncio.Event | None = None
         self.block_step: str | None = None
+        self.thinks: dict[str, list[bool]] = {}  # step -> the think flag of each call
 
     def _step(self, messages: list[dict]) -> str:
         text = messages[1]["content"] if len(messages) > 1 else messages[-1]["content"]
@@ -96,9 +97,11 @@ class FakeLLM:
                 return step
         raise AssertionError(f"FakeLLM: unknown prompt: {text[-300:]}")
 
-    async def chat(self, messages, *, schema=None, max_tokens=1024, on_progress=None, temperature=None) -> LLMResult:
+    async def chat(self, messages, *, schema=None, max_tokens=1024, on_progress=None, temperature=None,
+                   think=False) -> LLMResult:
         step = self._step(messages)
         self.calls.append(step)
+        self.thinks.setdefault(step, []).append(think)
         if self.block_step == step and self.gate is not None:
             await self.gate.wait()
         if on_progress is not None:

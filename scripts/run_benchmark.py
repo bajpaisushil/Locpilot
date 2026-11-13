@@ -18,7 +18,10 @@ For each fixture in ``fixtures/*/benchmark.json`` this script:
    - existing_tests_pass: the fixture's original tests pass on the patched worktree
    - within_limits: the task terminated with LLM calls/retries within budget
 
+It also records the model's peak memory use (from Ollama's /api/ps) during each run.
+
 Usage: uv run --project backend python scripts/run_benchmark.py [--fixtures a,b] [--model NAME]
+       [--thinking auto|on|off] [--output PATH]
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import platform
 import shutil
@@ -35,6 +39,8 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
@@ -111,16 +117,34 @@ def validate_fixture(fixture: str, spec: dict, tmp: Path) -> dict:
             "existing_tests_pass_on_original": existing, "valid": (not acc_orig) and acc_fixed and existing}
 
 
-async def run_agent(fixture: str, spec: dict, tmp: Path, model: str | None, max_minutes: float) -> dict:
+async def sample_memory(base_url: str, model: str, peak: list[int]) -> None:
+    """Keep the largest memory size Ollama reports for ``model`` in ``peak[0]`` (until cancelled)."""
+    async with httpx.AsyncClient(timeout=3) as client:
+        while True:
+            try:
+                for m in (await client.get(f"{base_url}/api/ps")).json().get("models", []):
+                    if m.get("name") == model:
+                        peak[0] = max(peak[0], int(m.get("size") or 0))
+            except (httpx.HTTPError, ValueError):
+                pass
+            await asyncio.sleep(2)
+
+
+async def run_agent(fixture: str, spec: dict, tmp: Path, model: str | None, max_minutes: float,
+                    thinking: str | None = None) -> dict:
     repo = fresh_repo(fixture, tmp / fixture)
     overrides = {"data_dir": tmp / f"data-{fixture}", "allowed_repo_roots": [tmp]}
     if model:
         overrides["model"] = model
+    if thinking:
+        overrides["thinking"] = thinking
     settings = Settings(**overrides)
     app = create_app(settings)
     db, manager = app.state.db, app.state.manager
     start = time.monotonic()
     approvals = 0
+    peak = [0]
+    sampler = asyncio.create_task(sample_memory(settings.ollama_url, settings.model, peak))
     async with app.router.lifespan_context(app):
         await app.state.llm_factory().ensure_ready()
         r = db.add_repo(name=fixture, source_type="local", source_url=None, path=str(repo), managed=False)
@@ -145,9 +169,11 @@ async def run_agent(fixture: str, spec: dict, tmp: Path, model: str | None, max_
         row = db.get_task(task["id"])
         reports = db.list_reports(task["id"])
         patches = db.list_patches(task["id"])
+    sampler.cancel()
     report = reports[-1] if reports else {}
     return {"repo": repo, "task": row, "report": report, "patches": patches, "approvals": approvals,
-            "duration_s": round(time.monotonic() - start, 1), "timed_out": timed_out, "settings": settings}
+            "duration_s": round(time.monotonic() - start, 1), "timed_out": timed_out, "settings": settings,
+            "peak_memory_gb": round(peak[0] / 1e9, 2) if peak[0] else None}
 
 
 def score(fixture: str, spec: dict, run: dict, tmp: Path) -> dict:
@@ -170,6 +196,7 @@ def score(fixture: str, spec: dict, run: dict, tmp: Path) -> dict:
         "agent_claimed_regression": ((report.get("verification") or {}).get("regression_test") or {}).get("status"),
         "within_limits": False, "llm_calls": (report.get("stats") or {}).get("llm_calls"),
         "retries": report.get("retries"), "approvals": run["approvals"], "duration_s": run["duration_s"],
+        "peak_memory_gb": run.get("peak_memory_gb"),
         "intent": report.get("intent"), "root_cause_citations": [f"{c['path']}:{c['start_line']}-{c['end_line']}"
                                                                  for c in cites],
         "known_bug_lines": {k: sorted(v) for k, v in bug_lines.items()},
@@ -210,14 +237,14 @@ def markdown(results: list[dict], meta: dict) -> str:
 
     lines = [
         "# LocPilot agent benchmark — measured results", "",
-        f"- Date: {meta['date']}", f"- Model: `{meta['model']}` via local Ollama",
+        f"- Date: {meta['date']}", f"- Model: `{meta['model']}` via local Ollama (thinking: {meta['thinking']})",
         f"- Machine: {meta['machine']}", f"- Fixtures: {len(results)} small, deterministic bug-fix repositories "
         "(`fixtures/`)", "- Harness auto-approved the agent's patches and test commands (the app itself always asks "
         "a human).", "",
         "| Fixture | Fixture valid | Relevant files | Root cause (location) | Root cause (concept) | Patch passes hidden "
         "tests | Regression test detects bug | Existing tests pass | Within limits | Agent status | LLM calls | "
-        "Retries | Time |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "Retries | Time | Model RAM |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         a = r.get("agent") or {}
@@ -226,7 +253,8 @@ def markdown(results: list[dict], meta: dict) -> str:
                      f"{mark(a.get('patch_accepted'))} | {mark(a.get('regression_test_detects_bug'))} | "
                      f"{mark(a.get('existing_tests_pass'))} | {mark(a.get('within_limits'))} | "
                      f"{a.get('status', r.get('error', 'not run'))} | {a.get('llm_calls', '—')} | "
-                     f"{a.get('retries', '—')} | {a.get('duration_s', '—')}s |")
+                     f"{a.get('retries', '—')} | {a.get('duration_s', '—')}s | "
+                     f"{a.get('peak_memory_gb') or '—'} GB |")
     keys = ["relevant_files", "root_cause_location", "root_cause_keywords", "patch_accepted",
             "regression_test_detects_bug", "existing_tests_pass", "within_limits"]
     ran = [r["agent"] for r in results if r.get("agent")]
@@ -251,9 +279,13 @@ def markdown(results: list[dict], meta: dict) -> str:
 
 
 async def main() -> None:
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
+    logging.getLogger("locpilot.ollama").setLevel(logging.INFO)  # e.g. a thinking model's reasoning cut off
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixtures", default="")
     parser.add_argument("--model", default=None)
+    parser.add_argument("--thinking", choices=["auto", "on", "off"], default=None,
+                        help="when a thinking model reasons first (default: the LOCPILOT_THINKING setting)")
     parser.add_argument("--max-minutes", type=float, default=15)
     parser.add_argument("--output", default=str(ROOT / "docs" / "benchmark-results.md"))
     parser.add_argument("--validate-only", action="store_true")
@@ -268,13 +300,14 @@ async def main() -> None:
         print(f"[{name}] fixture check: {entry['fixture_check']}", flush=True)
         if not args.validate_only and entry["fixture_check"]["valid"]:
             try:
-                run = await run_agent(name, spec, tmp, args.model, args.max_minutes)
+                run = await run_agent(name, spec, tmp, args.model, args.max_minutes, args.thinking)
                 entry["agent"] = score(name, spec, run, tmp)
             except Exception as exc:  # noqa: BLE001 - record and continue with the next fixture
                 entry["error"] = f"{type(exc).__name__}: {exc}"
             print(f"[{name}] {json.dumps(entry.get('agent') or entry.get('error'), default=str)}", flush=True)
         results.append(entry)
     meta = {"date": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"), "model": model,
+            "thinking": args.thinking or Settings().thinking,
             "machine": f"{platform.machine()} {platform.system()} {platform.release()}, "
                        f"{os.cpu_count()} CPUs"}
     if sys.platform == "darwin":

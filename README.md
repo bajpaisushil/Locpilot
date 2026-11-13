@@ -61,7 +61,7 @@ cloud model fallback.
 |---|---|
 | OS | macOS 11+ (Apple Silicon or Intel) — primary target. Windows 10+/Linux builds are produced by CI but untested by the author. |
 | Ollama | Installed separately: https://ollama.com/download (or `brew install ollama`) |
-| Model | Default `qwen2.5-coder:7b` (≈4.7 GB download, ~6–8 GB RAM while running). Any local Ollama chat model can be selected. |
+| Model | Default `mimo-v2.6:9b-q4_K_M` (≈6.6 GB download, ~5.8 GB RAM while running). Any local Ollama chat model can be selected; if the default isn't installed, LocPilot uses one you have. |
 | Git | `xcode-select --install` on macOS |
 | To build from source | [uv](https://docs.astral.sh/uv/), Node 20+, and Rust (rustup) for the desktop shell |
 
@@ -72,7 +72,7 @@ cloud model fallback.
 scripts/setup_macos.sh                    # --install-tools --install-ollama --pull-model --with-rust
 
 # 2. local model (skip if you used --pull-model); LocPilot starts an installed Ollama by itself
-ollama pull qwen2.5-coder:7b              # needs Ollama running: `ollama serve` or the Ollama app
+ollama pull mimo-v2.6:9b-q4_K_M           # needs Ollama running: `ollama serve` or the Ollama app
 
 # 3a. run as a desktop app (dev build; needs Rust)
 uv run --project backend python scripts/build_sidecar.py   # bundle the Python backend for Tauri
@@ -187,7 +187,7 @@ docs/               architecture, API contract, security, desktop packaging, tro
 
 ## Status and known limitations
 
-Verified on an Apple M4 (16 GB, macOS 26) with `qwen2.5-coder:7b`:
+Verified on an Apple M4 (16 GB, macOS 27) with `mimo-v2.6:9b-q4_K_M` (earlier releases: `qwen2.5-coder:7b`):
 
 * Desktop app (`LocPilot.app` / `.dmg`) builds, starts its bundled backend with a per-launch token,
   and shuts it down with the window; browser dev mode via `scripts/dev.sh`.
@@ -195,11 +195,11 @@ Verified on an Apple M4 (16 GB, macOS 26) with `qwen2.5-coder:7b`:
   validated citations; Code-mode patch → approval → regression test fails before / passes after
   the fix → full test run in the macOS sandbox; bounded repair; rollback; `.patch` download;
   restart recovery and resume.
-* Automated checks: `scripts/test.sh` (84 backend tests, 45 frontend tests, fixture validity).
+* Automated checks: `scripts/test.sh` (139 backend tests, 75 frontend tests, fixture validity).
 
 Known limitations — stated plainly:
 
-* **Model quality.** A 7B local model makes mistakes: wrong root causes, fixes in the wrong place,
+* **Model quality.** A 9B local model makes mistakes: wrong root causes, fixes in the wrong place,
   or regression tests that encode the wrong expectation. LocPilot surfaces these instead of
   hiding them (unverified/failed statuses, removed citations), but "verified" only means
   *LocPilot's own regression test failed before the change and passes after it* — review the
