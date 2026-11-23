@@ -3,7 +3,8 @@ import { ModeBadge, TaskStatusBadge } from '@/components/common/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
 import { useModelStatus, useRepo, useTask } from '@/lib/queries'
-import { cn } from '@/lib/utils'
+import { memorySummary } from '@/lib/memory'
+import { cn, formatBytes } from '@/lib/utils'
 import { useUi } from '@/store/ui'
 
 export function ModelStatusPill() {
@@ -12,6 +13,7 @@ export function ModelStatusPill() {
   let tone = 'bg-muted-foreground/50'
   let text = 'Checking model…'
   let hint = 'Checking local model status'
+  let ram: string | null = null
   if (model.isError) {
     tone = 'bg-destructive'
     text = 'Backend error'
@@ -26,9 +28,15 @@ export function ModelStatusPill() {
       text = `${model.data.configured_model} missing`
       hint = model.data.hint ?? 'Download the configured model'
     } else {
-      tone = 'bg-success'
+      const mem = model.data.memory
+      tone = mem?.short ? 'bg-warning' : 'bg-success'
       text = model.data.configured_model
+      ram = mem?.loaded_bytes ? formatBytes(mem.loaded_bytes) : null
       hint = `${text} — local inference via Ollama ${model.data.ollama_version ?? ''} · context ${model.data.num_ctx} tokens`
+      const summary = memorySummary(mem)
+      if (summary) hint += ` · ${summary}`
+      if (mem?.short)
+        hint += ' · Not enough free memory: close other apps, or pick a smaller model or context window in Settings.'
     }
   }
   return (
@@ -44,6 +52,11 @@ export function ModelStatusPill() {
         <CpuIcon className="size-3.5 shrink-0 text-muted-foreground" />
         {/* With the side panel open the header is narrow: then only the dot shows (the name is in the hint). */}
         <span className="hidden max-w-44 truncate font-mono text-[11px] @min-[560px]:block">{text}</span>
+        {ram && (
+          <span className="hidden text-[11px] text-muted-foreground @min-[720px]:block" data-testid="model-ram">
+            {ram}
+          </span>
+        )}
       </button>
     </Hint>
   )

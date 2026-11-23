@@ -131,13 +131,28 @@ def ollama_host_value(base_url: str) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
-def serve_env(base_url: str) -> dict[str, str]:
+def memory_saving_env(kv_cache_type: str) -> dict[str, str]:
+    """Ollama settings that shrink the context's memory (the KV cache) for an ``ollama serve`` LocPilot starts.
+
+    Flash attention is what lets Ollama store the cache in 8 bits (``q8_0``): about half the memory of the default
+    16 bits, with no measurable loss in answer quality. Ollama ignores both for models that don't support them.
+    An empty ``kv_cache_type`` leaves Ollama's defaults alone.
+    """
+    if not kv_cache_type:
+        return {}
+    return {"OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_KV_CACHE_TYPE": kv_cache_type}
+
+
+def serve_env(base_url: str, defaults: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for ``ollama serve``. ``defaults`` apply only where the user hasn't set the variable themselves."""
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("LOCPILOT_")}  # never pass our token on
     # A PyInstaller onefile build on Linux points LD_LIBRARY_PATH at its own bundle; give Ollama the user's.
     if "LD_LIBRARY_PATH_ORIG" in env:
         env["LD_LIBRARY_PATH"] = env.pop("LD_LIBRARY_PATH_ORIG")
     elif getattr(sys, "frozen", False):
         env.pop("LD_LIBRARY_PATH", None)
+    for key, value in (defaults or {}).items():
+        env.setdefault(key, value)
     env["OLLAMA_HOST"] = ollama_host_value(base_url)
     return env
 
@@ -167,12 +182,13 @@ def _stop_process(proc: subprocess.Popen) -> None:
 
 class OllamaLauncher:
     def __init__(self, base_url: str, logs_dir: Path, *, enabled: bool = True, ollama_path: Path | None = None,
-                 start_timeout_s: float = 45.0) -> None:
+                 start_timeout_s: float = 45.0, env_defaults: dict[str, str] | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.logs_dir = logs_dir
         self.enabled = enabled
         self.ollama_path = ollama_path
         self.start_timeout_s = start_timeout_s
+        self.env_defaults = dict(env_defaults or {})  # e.g. memory_saving_env(): only for a server we start
         self._lock = asyncio.Lock()
         self._proc: subprocess.Popen | None = None  # the `ollama serve` LocPilot started, if any
         self._install: OllamaInstall | None = None  # what the last start attempt launched
@@ -290,7 +306,8 @@ class OllamaLauncher:
             with open(self.log_path, "ab") as out:
                 self._log_offset = out.tell()
                 self._proc = subprocess.Popen([str(binary), "serve"], stdin=subprocess.DEVNULL, stdout=out,
-                                              stderr=subprocess.STDOUT, env=serve_env(self.base_url),
+                                              stderr=subprocess.STDOUT,
+                                              env=serve_env(self.base_url, self.env_defaults),
                                               cwd=str(Path.home()), **kwargs)
         except OSError as exc:
             self._proc = None

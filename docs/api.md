@@ -89,6 +89,7 @@ the model; LocPilot itself never downloads models and the installer never bundle
 |---|---|---|
 | GET | `/api/model/status` | `ModelStatus` |
 | PUT | `/api/model/config` | body `{ model?: string, num_ctx?: number, temperature?: number }` → `ModelStatus` |
+| POST | `/api/model/unload` | frees the model's RAM now (409 while a task runs) → `{ unloaded: string[] }` |
 
 ```ts
 interface ModelInfo { name: string; size_bytes: number | null; parameter_size: string | null;
@@ -98,7 +99,14 @@ interface ModelInfo { name: string; size_bytes: number | null; parameter_size: s
 interface ModelStatus { ollama_reachable: boolean; ollama_version: string | null; ollama_url: string;
   configured_model: string; model_available: boolean; models: ModelInfo[]; num_ctx: number;
   temperature: number; error: string | null; hint: string | null;
-  switched_from: string | null }   // the missing model LocPilot replaced with this installed one, if it did
+  switched_from: string | null;    // the missing model LocPilot replaced with this installed one, if it did
+  memory: ModelMemory | null }     // only when the model is installed
+interface ModelMemory { total_bytes: number | null; available_bytes: number | null;  // RAM usable without swapping
+  loaded_bytes: number | null;     // what the model takes now (Ollama /api/ps), when loaded
+  needed_bytes: number | null;     // what loading it would take (weights + context + overhead); 0 when loaded
+  context_bytes: number | null;    // the context window alone, from the model's architecture
+  kv_cache_type: string;           // "q8_0" when LocPilot started Ollama (half the memory), else "f16"
+  short: boolean }                 // loading it would not fit: the machine would swap (a task also logs a warning)
 ```
 
 If the configured model is not installed but other chat models are, `GET /api/model/status`,
@@ -106,6 +114,24 @@ If the configured model is not installed but other chat models are, `GET /api/mo
 half the RAM; embedding-only models are skipped) and save it as the model setting. Not while a download
 started from the setup screen is running. Choosing a model with `PUT /api/model/config` clears
 `switched_from`.
+
+### Storage
+
+| Method | Path | Response |
+|---|---|---|
+| GET | `/api/storage` | `StorageInfo`: disk used by task worktrees (each with `can_archive`/`reason`), archived worktrees, task history, saved agent states (`checkpoints_bytes`), logs, command caches, the code index and Ollama's models |
+| POST | `/api/storage/archive-worktrees` | body `{ task_ids?: string[] }` (default: every finished task) → `{ archived, skipped: [{task_id, reason}], bytes_freed }` |
+| POST | `/api/storage/clean-up` | → `{ bytes_freed, details: { history, checkpoints, logs, caches, index } }` |
+
+*Archiving* saves a finished task's worktree — its HEAD commit plus a patch of every change, new files
+included — to `<data dir>/archived-worktrees/<task>.json` and removes the folder. Anything that needs the
+worktree again (a message, the file viewer, a command, a terminal, diff/commit/apply) restores it first.
+Tasks that are running, awaiting approval, running a command or have a terminal open are skipped; so is a
+worktree whose HEAD is on no branch (commit it first). Ignored files (build output) are not kept.
+
+*Clean up* keeps only the newest saved agent state of each idle task's last turn (what follow-ups read),
+removes command caches of idle or deleted tasks, empties `ollama.log`/`llm-debug.jsonl` and old
+rotated logs, drops index entries for folders that are gone, then compacts the SQLite files.
 
 ### Repositories
 

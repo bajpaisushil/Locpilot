@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import shutil
 import sys
+import threading
+import time
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +19,9 @@ from locpilot.security.commands import validate_command
 from locpilot.security.sandbox import wrap_argv
 from locpilot.storage.db import Database
 from locpilot.tools import git
+from locpilot.tools.files import drop_index
 from locpilot.tools.process import base_env, run_async
+from locpilot.tools.symbols import forget_symbols
 from locpilot.tools.testparse import parse_test_output
 
 Emit = Callable[..., Awaitable[None]]
@@ -49,15 +56,140 @@ def prepare_worktree(settings: Settings, repo_path: Path, task_id: str) -> dict:
             )
     except git.GitError:
         pass
-    node_modules = repo_path / "node_modules"
-    if node_modules.is_dir() and not (dest / "node_modules").exists():
-        try:
-            os.symlink(node_modules, dest / "node_modules", target_is_directory=True)
-            notices.append("Linked node_modules from your checkout so JavaScript tests can run without installing "
-                           "dependencies.")
-        except OSError:
-            notices.append("Could not link node_modules into the worktree; JavaScript tests may fail to run.")
+    linked = _link_node_modules(repo_path, dest)
+    if linked is True:
+        notices.append("Linked node_modules from your checkout so JavaScript tests can run without installing "
+                       "dependencies.")
+    elif linked is False:
+        notices.append("Could not link node_modules into the worktree; JavaScript tests may fail to run.")
     return {"worktree_path": str(dest), "base_commit": base, "notices": notices}
+
+
+def _link_node_modules(repo_path: Path, dest: Path) -> bool | None:
+    """Link the user's node_modules into a worktree: True if linked, False if that failed, None if not needed."""
+    node_modules = repo_path / "node_modules"
+    if not node_modules.is_dir() or (dest / "node_modules").exists():
+        return None
+    try:
+        os.symlink(node_modules, dest / "node_modules", target_is_directory=True)
+        return True
+    except OSError:
+        return False
+
+
+# --- Freeing disk space: archive a finished task's worktree, restore it on next use ----------------------
+#
+# A worktree is a full checkout, so finished tasks can add up to gigabytes. Archiving keeps exactly what matters —
+# the worktree's HEAD commit plus a patch of every change in it (edits, deletions, new files) — in a small file,
+# then removes the folder. Anything that needs the worktree again (a follow-up message, the file viewer, a
+# command, a terminal, commit/apply) restores it first, so nothing is lost. Ignored files (build output, caches)
+# are not kept: they can be regenerated.
+
+ARCHIVE_VERSION = 1
+_restore_locks: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
+
+
+def archive_path(settings: Settings, task_id: str) -> Path:
+    return settings.data_dir / "archived-worktrees" / f"{task_id}.json"
+
+
+def worktree_is_archived(settings: Settings, task: dict) -> bool:
+    wt = task.get("worktree_path")
+    return bool(wt) and not (Path(wt) / ".git").exists() and archive_path(settings, task["id"]).is_file()
+
+
+def directory_size(path: Path) -> int:
+    """Bytes used by the files under ``path``; links (such as the node_modules link) are not followed."""
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def archive_worktree(settings: Settings, repo_path: Path, task: dict) -> int:
+    """Save a task worktree's state to a small file and remove the folder. Returns the bytes freed."""
+    wt = Path(task["worktree_path"])
+    if not (wt / ".git").exists():
+        raise WorkspaceError("This task's worktree does not exist.")
+    if not wt.resolve().is_relative_to(settings.worktrees_dir.resolve()):
+        raise WorkspaceError("Refusing to archive a folder outside LocPilot's worktrees.")
+    head = git.head_commit(wt)
+    if not head:
+        raise WorkspaceError("Could not read the worktree's commit.")
+    if not git.commit_is_kept(repo_path, head):
+        raise WorkspaceError("The worktree has commits that are on no branch; commit them to a branch first.")
+    freed = directory_size(wt)
+    diff = git.worktree_snapshot_diff(wt)
+    target = archive_path(settings, task["id"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"version": ARCHIVE_VERSION, "task_id": task["id"], "head": head, "diff": diff,
+                               "archived_at": time.time()}), encoding="utf-8")
+    tmp.replace(target)  # the archive is complete before anything is removed
+    git.worktree_remove(repo_path, wt, managed_root=settings.worktrees_dir)
+    drop_index(wt)
+    forget_symbols(wt)
+    scratch = settings.scratch_dir / task["id"]  # caches of the task's commands (npm, go build, tmp)
+    if scratch.is_dir() and scratch.resolve().is_relative_to(settings.scratch_dir.resolve()):
+        freed += directory_size(scratch)
+        shutil.rmtree(scratch, ignore_errors=True)
+    return freed
+
+
+def restore_worktree(settings: Settings, repo_path: Path, task: dict) -> bool:
+    """Recreate an archived worktree exactly as it was. Returns True if it was restored."""
+    with _restore_locks[task["id"]]:
+        if not worktree_is_archived(settings, task):
+            return False
+        source = archive_path(settings, task["id"])
+        data = json.loads(source.read_text(encoding="utf-8"))
+        wt = Path(task["worktree_path"])
+        head = data["head"]
+        if not git.has_commit(repo_path, head):
+            raise WorkspaceError(f"The commit this task's worktree was based on ({head[:10]}) is no longer in the "
+                                 f"repository. Its saved changes are in {source}.")
+        if wt.exists():  # an empty or broken leftover folder
+            shutil.rmtree(wt, ignore_errors=True)
+        git.worktree_add(repo_path, wt, head, hooks_dir=settings.empty_hooks_dir)
+        if data.get("diff", "").strip():
+            patch = settings.scratch_dir / task["id"] / "restore.patch"
+            patch.parent.mkdir(parents=True, exist_ok=True)
+            patch.write_text(data["diff"], encoding="utf-8")
+            try:
+                git.apply_snapshot_diff(wt, patch)
+            except git.GitError as exc:
+                git.worktree_remove(repo_path, wt, managed_root=settings.worktrees_dir)
+                raise WorkspaceError(f"Could not restore this task's worktree: {exc}. Its saved changes are in "
+                                     f"{source}.") from exc
+            finally:
+                patch.unlink(missing_ok=True)
+        _link_node_modules(repo_path, wt)
+        source.unlink()
+        drop_index(wt)
+        return True
+
+
+async def ensure_task_worktree(settings: Settings, db: Database, task: dict | None) -> None:
+    """Before anything uses a task's worktree: restore it if it was archived to free space."""
+    if not task or not worktree_is_archived(settings, task):
+        return
+    repo = db.get_repo(task["repo_id"])
+    if repo is None:
+        raise WorkspaceError("The task's repository is no longer connected.")
+    await asyncio.to_thread(restore_worktree, settings, Path(repo["path"]), task)
 
 
 def command_env(settings: Settings, task_id: str, workspace: Path, env: dict[str, str]) -> dict[str, str]:

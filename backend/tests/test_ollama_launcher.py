@@ -20,7 +20,7 @@ import pytest
 
 from locpilot.app import create_app
 from locpilot.llm import launcher as launcher_mod
-from locpilot.llm.launcher import ollama_host_value
+from locpilot.llm.launcher import memory_saving_env, ollama_host_value, serve_env
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="fake ollama is a POSIX script")
 
@@ -299,3 +299,16 @@ def test_ollama_host_matches_the_configured_url():
     assert ollama_host_value("http://127.0.0.1:11434") == "127.0.0.1:11434"
     assert ollama_host_value("http://localhost:11500/") == "localhost:11500"
     assert ollama_host_value("http://[::1]:11434") == "[::1]:11434"
+
+
+def test_ollama_we_start_stores_the_context_in_8_bits_unless_the_user_chose(monkeypatch):
+    monkeypatch.delenv("OLLAMA_KV_CACHE_TYPE", raising=False)
+    monkeypatch.delenv("OLLAMA_FLASH_ATTENTION", raising=False)
+    defaults = memory_saving_env("q8_0")
+    env = serve_env("http://127.0.0.1:11434", defaults)
+    assert env["OLLAMA_KV_CACHE_TYPE"] == "q8_0" and env["OLLAMA_FLASH_ATTENTION"] == "1"
+    monkeypatch.setenv("OLLAMA_KV_CACHE_TYPE", "f16")  # the user's own setting wins
+    assert serve_env("http://127.0.0.1:11434", defaults)["OLLAMA_KV_CACHE_TYPE"] == "f16"
+    assert memory_saving_env("") == {}  # "" keeps Ollama's defaults
+    monkeypatch.delenv("OLLAMA_KV_CACHE_TYPE")
+    assert "OLLAMA_KV_CACHE_TYPE" not in serve_env("http://127.0.0.1:11434")

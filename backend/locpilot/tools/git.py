@@ -269,6 +269,33 @@ def worktree_remove(repo: Path, dest: Path, *, managed_root: Path) -> None:
     _git(["worktree", "prune"], repo, timeout=60, check=False)
 
 
+def has_commit(repo: Path, commit: str) -> bool:
+    return _git(["cat-file", "-e", f"{commit}^{{commit}}"], repo, timeout=30, check=False).ok
+
+
+def commit_is_kept(repo: Path, commit: str) -> bool:
+    """Whether ``commit`` stays in the repository without a worktree: on a branch/tag, or under the checkout's HEAD."""
+    refs = _git(["for-each-ref", "--contains", commit, "--count=1", "--format=%(refname)"], repo, timeout=120,
+                check=False)
+    if refs.ok and refs.stdout.strip():
+        return True
+    return _git(["merge-base", "--is-ancestor", commit, "HEAD"], repo, timeout=60, check=False).ok
+
+
+def worktree_snapshot_diff(worktree: Path) -> str:
+    """Every change in a worktree relative to its HEAD — edits, deletions and new (not ignored) files — as a patch.
+
+    New files are marked intent-to-add in the worktree's own index so the diff includes them; LocPilot's
+    node_modules link is never part of it.
+    """
+    _git(["add", "-A", "--intent-to-add", "--", ".", ":(exclude)node_modules"], worktree, timeout=120)
+    return _git(["diff", "--binary", "--no-color", "--no-ext-diff", "HEAD"], worktree, timeout=300).stdout
+
+
+def apply_snapshot_diff(worktree: Path, patch_file: Path) -> None:
+    _git(["apply", "--binary", "--whitespace=nowarn", str(patch_file)], worktree, timeout=300)
+
+
 # --- Explicit user actions: bring a worktree's changes out ----------------------------
 
 # LocPilot links the user's node_modules into worktrees; the link is never part of a change.

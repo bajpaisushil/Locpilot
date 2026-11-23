@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { CpuIcon, MoonIcon, ShieldCheckIcon, SunIcon, WrenchIcon } from 'lucide-react'
+import { CpuIcon, HardDriveIcon, MoonIcon, ShieldCheckIcon, SunIcon, WrenchIcon } from 'lucide-react'
 import { useState } from 'react'
 import { ErrorState, LoadingState } from '@/components/common/States'
 import { Badge } from '@/components/ui/badge'
@@ -10,7 +10,8 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { api } from '@/lib/api'
-import { qk, useModelStatus } from '@/lib/queries'
+import { memorySummary } from '@/lib/memory'
+import { qk, useModelStatus, useStorage } from '@/lib/queries'
 import type { ModelStatus } from '@/lib/types'
 import { formatBytes } from '@/lib/utils'
 import { useUi } from '@/store/ui'
@@ -100,6 +101,138 @@ function ModelForm({ status }: { status: ModelStatus }) {
   )
 }
 
+function FreeRamButton() {
+  const qc = useQueryClient()
+  const unload = useMutation({
+    mutationFn: () => api.unloadModel(),
+    onSettled: () => void qc.invalidateQueries({ queryKey: qk.model }),
+  })
+  return (
+    <span className="flex shrink-0 items-center gap-2">
+      {unload.isError && <span className="text-warning">{(unload.error as Error).message}</span>}
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-6 px-2 text-[11px]"
+        title="Unload the model from memory now; your next message loads it again."
+        disabled={unload.isPending}
+        onClick={() => unload.mutate()}
+      >
+        Free RAM now
+      </Button>
+    </span>
+  )
+}
+
+function StorageSection() {
+  const qc = useQueryClient()
+  const storage = useStorage(true)
+  const archive = useMutation({
+    mutationFn: () => api.archiveWorktrees(),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: qk.storage }),
+  })
+  const cleanUp = useMutation({
+    mutationFn: () => api.cleanUp(),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: qk.storage }),
+  })
+  const data = storage.data
+  const active = data?.worktrees.filter((w) => w.state === 'active') ?? []
+  const busy = active.filter((w) => !w.can_archive)
+  return (
+    <section className="space-y-2" data-testid="storage-section">
+      <div className="flex items-center gap-2 text-sm font-medium">
+        <HardDriveIcon className="size-4 text-primary" />
+        Storage
+      </div>
+      {storage.isLoading && <LoadingState />}
+      {storage.isError && <ErrorState error={storage.error} compact onRetry={() => void storage.refetch()} />}
+      {data && (
+        <>
+          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+            <dt className="text-muted-foreground">Task worktrees</dt>
+            <dd>
+              {formatBytes(data.worktrees_bytes)} in {active.length} {active.length === 1 ? 'task' : 'tasks'}
+              {data.archived_count > 0 && (
+                <span className="text-muted-foreground">
+                  {' '}
+                  · {data.archived_count} archived ({formatBytes(data.archived_bytes)})
+                </span>
+              )}
+            </dd>
+            <dt className="text-muted-foreground">Saved agent states</dt>
+            <dd>{formatBytes(data.checkpoints_bytes)}</dd>
+            <dt className="text-muted-foreground">Task history</dt>
+            <dd>{formatBytes(data.history_bytes)}</dd>
+            <dt className="text-muted-foreground">Command caches · logs</dt>
+            <dd>
+              {formatBytes(data.caches_bytes)} · {formatBytes(data.logs_bytes)}
+            </dd>
+            <dt className="text-muted-foreground">Code index</dt>
+            <dd>{formatBytes(data.index_bytes)}</dd>
+            {data.models_bytes !== null && (
+              <>
+                <dt className="text-muted-foreground">Models (in Ollama)</dt>
+                <dd>{formatBytes(data.models_bytes)}</dd>
+              </>
+            )}
+            <dt className="text-muted-foreground">Folder</dt>
+            <dd className="truncate font-mono" title={data.data_dir}>
+              {data.data_dir}
+            </dd>
+          </dl>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-[11px] text-muted-foreground">
+              Archiving keeps a finished task&apos;s changes in a small file and removes its worktree; opening the task
+              again restores it. Build output and other ignored files are not kept.
+              {busy.length > 0 && ` ${busy.length} in use: ${busy.map((w) => w.reason).filter(Boolean)[0]}.`}
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0"
+              disabled={data.archivable_bytes === 0 || archive.isPending}
+              onClick={() => archive.mutate()}
+            >
+              Free {formatBytes(data.archivable_bytes)}
+            </Button>
+          </div>
+          {archive.data && (
+            <p className="text-[11px] text-muted-foreground" data-testid="archive-result">
+              Freed {formatBytes(archive.data.bytes_freed)} from {archive.data.archived.length}{' '}
+              {archive.data.archived.length === 1 ? 'task' : 'tasks'}
+              {archive.data.skipped.length > 0 && `; kept ${archive.data.skipped.length} (${archive.data.skipped[0].reason})`}
+              .
+            </p>
+          )}
+          {archive.isError && <ErrorState error={archive.error} compact />}
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-[11px] text-muted-foreground">
+              Clean up removes what finished tasks no longer need — the agent&apos;s older saved states, command
+              caches, logs and stale index entries — and compacts the databases. Your tasks, their history and
+              follow-ups keep working.
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0"
+              disabled={cleanUp.isPending}
+              onClick={() => cleanUp.mutate()}
+            >
+              Clean up
+            </Button>
+          </div>
+          {cleanUp.data && (
+            <p className="text-[11px] text-muted-foreground" data-testid="clean-up-result">
+              Freed {formatBytes(cleanUp.data.bytes_freed)}.
+            </p>
+          )}
+          {cleanUp.isError && <ErrorState error={cleanUp.error} compact />}
+        </>
+      )}
+    </section>
+  )
+}
+
 export function SettingsDialog() {
   const open = useUi((s) => s.settingsOpen)
   const setOpen = useUi((s) => s.setSettingsOpen)
@@ -113,7 +246,7 @@ export function SettingsDialog() {
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
-          <DialogDescription>Local model, appearance and dependency setup.</DialogDescription>
+          <DialogDescription>Local model, storage, appearance and dependency setup.</DialogDescription>
         </DialogHeader>
 
         <section className="space-y-3">
@@ -135,6 +268,18 @@ export function SettingsDialog() {
                 Ollama {model.data.ollama_version ?? '(unreachable)'} at{' '}
                 <span className="font-mono">{model.data.ollama_url}</span>
                 {model.data.error && <div className="mt-1 text-warning">{model.data.error}</div>}
+                {memorySummary(model.data.memory) && (
+                  <div className="mt-1 flex items-center justify-between gap-2" data-testid="model-memory">
+                    <span>Memory: {memorySummary(model.data.memory)}</span>
+                    {!!model.data.memory?.loaded_bytes && <FreeRamButton />}
+                  </div>
+                )}
+                {model.data.memory?.short && (
+                  <div className="mt-1 text-warning">
+                    Not enough free memory to load this model without swapping: close other apps, or pick a smaller
+                    model or context window.
+                  </div>
+                )}
                 {model.data.switched_from && (
                   <div className="mt-1" data-testid="model-switched-note">
                     <span className="font-mono">{model.data.switched_from}</span> is not installed, so LocPilot
@@ -147,6 +292,10 @@ export function SettingsDialog() {
             </>
           )}
         </section>
+
+        <Separator />
+
+        <StorageSection />
 
         <Separator />
 

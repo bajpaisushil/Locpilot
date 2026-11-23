@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -109,12 +111,95 @@ def extract_json(text: str) -> Any:
         raise
 
 
+def _windows_memory() -> tuple[int, int] | None:
+    """(installed, available) bytes on Windows."""
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(MemoryStatus)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):  # type: ignore[attr-defined]
+        return None
+    return status.ullTotalPhys, status.ullAvailPhys
+
+
 def physical_memory() -> int | None:
-    """Installed RAM in bytes, or None where it can't be read (Windows)."""
+    """Installed RAM in bytes, or None where it can't be read."""
+    if sys.platform == "win32":
+        try:
+            found = _windows_memory()
+        except (OSError, AttributeError, ValueError):
+            return None
+        return found[0] if found else None
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (AttributeError, ValueError, OSError):
         return None
+
+
+def available_memory() -> int | None:
+    """RAM that can be used without pushing other programs into swap, in bytes (None if unknown).
+
+    Linux: MemAvailable. macOS: free + inactive + speculative + purgeable pages (what the system can hand out
+    without swapping). Windows: available physical memory.
+    """
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo", encoding="ascii") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+            return None
+        if sys.platform == "darwin":
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3).stdout
+            page = re.search(r"page size of (\d+) bytes", out)
+            pages = dict(re.findall(r"^Pages (free|inactive|speculative|purgeable):\s+(\d+)", out, re.MULTILINE))
+            if not page or not pages:
+                return None
+            return int(page.group(1)) * sum(int(v) for v in pages.values())
+        if sys.platform == "win32":
+            found = _windows_memory()
+            return found[1] if found else None
+    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+        return None
+    return None
+
+
+# Bytes per cached value for Ollama's KV-cache types (q8_0/q4_0 store blocks of 32 values plus a scale).
+KV_BYTES_PER_VALUE = {"f16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32}
+OVERHEAD_BYTES = 600 * 2**20  # compute buffers and runtime besides the weights and the cache
+
+
+def kv_cache_bytes(model_info: dict, num_ctx: int, kv_cache_type: str = "f16") -> int | None:
+    """Memory the context of ``num_ctx`` tokens takes, from the model's architecture (``/api/show`` model_info).
+
+    An upper bound for models that only attend to a window in some layers. None when the architecture is unknown.
+    """
+    arch = model_info.get("general.architecture")
+    if not arch:
+        return None
+
+    def num(key: str) -> float | None:
+        value = model_info.get(f"{arch}.{key}")
+        if isinstance(value, list):  # per-layer values
+            value = max((v for v in value if isinstance(v, int | float)), default=None)
+        return float(value) if isinstance(value, int | float) and value > 0 else None
+
+    layers, heads = num("block_count"), num("attention.head_count")
+    heads_kv = num("attention.head_count_kv") or heads
+    width = num("embedding_length")
+    key_len = num("attention.key_length") or (width / heads if width and heads else None)
+    value_len = num("attention.value_length") or key_len
+    if not (layers and heads_kv and key_len and value_len):
+        return None
+    per_value = KV_BYTES_PER_VALUE.get(kv_cache_type or "f16", 2.0)
+    return int(layers * heads_kv * (key_len + value_len) * num_ctx * per_value)
 
 
 def pick_installed_model(models: list[dict], ram_bytes: int | None) -> str | None:
@@ -157,7 +242,7 @@ def reasoning_in_circles(text: str, window: int = 300) -> bool:
 
 
 # Model capabilities ("completion", "thinking", "tools", …) per (Ollama URL, model), read once per run.
-_capabilities_cache: dict[tuple[str, str], frozenset[str]] = {}
+_show_cache: dict[tuple[str, str], dict] = {}  # /api/show per (Ollama URL, model)
 
 
 def setup_hint(base_url: str, model: str) -> str:
@@ -168,7 +253,8 @@ def setup_hint(base_url: str, model: str) -> str:
 class OllamaClient:
     def __init__(self, base_url: str, model: str, *, num_ctx: int = 16384, temperature: float = 0.1,
                  timeout_s: float = 900.0, seed: int | None = 7, allow_remote: bool = False,
-                 keep_alive: str = "30m", usage: ModelUsage | None = None, thinking_tokens: int = 4096) -> None:
+                 keep_alive: str = "30m", usage: ModelUsage | None = None, thinking_tokens: int = 4096,
+                 kv_cache_type: str = "") -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.num_ctx = num_ctx
@@ -179,6 +265,9 @@ class OllamaClient:
         self.keep_alive = keep_alive  # how long Ollama keeps the model in RAM after the last request
         self.usage = usage
         self.thinking_tokens = thinking_tokens  # extra output budget for the reasoning when think=True
+        # How Ollama stores the context: set when LocPilot started Ollama with memory_saving_env(), else unknown
+        # ("": estimates assume Ollama's 16-bit default, so they err on the safe side).
+        self.kv_cache_type = kv_cache_type
 
     def _check_local(self) -> None:
         if not self.allow_remote and not ollama_url_is_local(self.base_url):
@@ -213,24 +302,75 @@ class OllamaClient:
         candidates = {model, model if ":" in model else f"{model}:latest"}
         return any(n in candidates for n in names)
 
-    async def capabilities(self) -> frozenset[str] | None:
-        """What the model can do (e.g. "thinking"), or None when Ollama doesn't say (older versions, errors)."""
+    async def _show(self) -> dict | None:
+        """Ollama's description of the model (``/api/show``), cached; None on errors."""
         key = (self.base_url, self.model)
-        if key in _capabilities_cache:
-            return _capabilities_cache[key]
+        if key in _show_cache:
+            return _show_cache[key]
         self._check_local()
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
                 resp = await client.post(f"{self.base_url}/api/show", json={"model": self.model})
                 resp.raise_for_status()
-                caps = resp.json().get("capabilities")
+                shown = resp.json()
         except (httpx.HTTPError, ValueError) as exc:
-            log.info("could not read the capabilities of %s: %s", self.model, exc)
+            log.info("could not read the details of %s: %s", self.model, exc)
             return None
+        if not isinstance(shown, dict):
+            return None
+        _show_cache[key] = shown
+        return shown
+
+    async def capabilities(self) -> frozenset[str] | None:
+        """What the model can do (e.g. "thinking"), or None when Ollama doesn't say (older versions, errors)."""
+        shown = await self._show()
+        caps = shown.get("capabilities") if shown else None
         if not isinstance(caps, list):
             return None
-        _capabilities_cache[key] = frozenset(str(c) for c in caps)
-        return _capabilities_cache[key]
+        return frozenset(str(c) for c in caps)
+
+    async def loaded_details(self) -> list[dict]:
+        """Models Ollama holds in memory, with the memory each one takes (weights + context)."""
+        self._check_local()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+            resp = await client.get(f"{self.base_url}/api/ps")
+            resp.raise_for_status()
+            return [{"name": m.get("name") or m.get("model"), "size_bytes": m.get("size"),
+                     "vram_bytes": m.get("size_vram"), "context_length": m.get("context_length")}
+                    for m in resp.json().get("models", []) if m.get("name") or m.get("model")]
+
+    async def memory_check(self) -> dict:
+        """How the configured model fits in memory right now.
+
+        ``needed_bytes`` is what loading it would take (weights + context + overhead), 0 when it is already loaded;
+        ``short`` is True when that is more than the RAM available, i.e. the machine would start swapping.
+        """
+        info: dict[str, Any] = {"total_bytes": physical_memory(), "available_bytes": available_memory(),
+                                "loaded_bytes": None, "needed_bytes": None, "context_bytes": None,
+                                "kv_cache_type": self.kv_cache_type or "f16", "short": False}
+        try:
+            loaded = await self.loaded_details()
+        except (httpx.HTTPError, ValueError):
+            loaded = []
+        mine = next((m for m in loaded if self.model_installed(self.model, [m["name"]])), None)
+        shown = await self._show()
+        if shown and isinstance(shown.get("model_info"), dict):
+            info["context_bytes"] = kv_cache_bytes(shown["model_info"], self.num_ctx, info["kv_cache_type"])
+        if mine is not None:
+            info["loaded_bytes"] = mine["size_bytes"]
+            info["needed_bytes"] = 0
+            return info
+        try:
+            size = next((m["size_bytes"] for m in await self.list_models()
+                         if self.model_installed(self.model, [m["name"]])), None)
+        except (httpx.HTTPError, ValueError):
+            size = None
+        if size:
+            context = info["context_bytes"] if info["context_bytes"] is not None else int(self.num_ctx / 16384 * 2**30)
+            info["needed_bytes"] = int(size) + context + OVERHEAD_BYTES
+            avail = info["available_bytes"]
+            info["short"] = avail is not None and info["needed_bytes"] > avail
+        return info
 
     async def loaded_models(self) -> list[str]:
         """Models Ollama currently holds in memory."""
@@ -271,7 +411,8 @@ class OllamaClient:
     async def status(self) -> dict:
         info: dict[str, Any] = {"ollama_reachable": False, "ollama_version": None, "ollama_url": self.base_url,
                                 "configured_model": self.model, "model_available": False, "models": [],
-                                "num_ctx": self.num_ctx, "temperature": self.temperature, "error": None, "hint": None}
+                                "num_ctx": self.num_ctx, "temperature": self.temperature, "error": None, "hint": None,
+                                "memory": None}
         try:
             info["ollama_version"] = await self.version()
             info["ollama_reachable"] = True
@@ -285,6 +426,8 @@ class OllamaClient:
             return info
         names = [m["name"] for m in info["models"] if m.get("name")]
         info["model_available"] = self.model_installed(self.model, names)
+        if info["model_available"]:
+            info["memory"] = await self.memory_check()
         if not info["model_available"]:
             info["error"] = f"Model '{self.model}' is not installed in Ollama"
             info["hint"] = f"Run `ollama pull {self.model}` or choose an installed model in Settings."

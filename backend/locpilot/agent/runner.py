@@ -15,11 +15,18 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from locpilot.agent.graph import AgentDeps, BudgetExceeded, build_graph, turn_input
-from locpilot.agent.workspace import USER_STAGE, WorkspaceError, execute_command, prepare_user_command
+from locpilot.agent.workspace import (
+    USER_STAGE,
+    WorkspaceError,
+    ensure_task_worktree,
+    execute_command,
+    prepare_user_command,
+)
 from locpilot.config import Settings
 from locpilot.llm.ollama import LLMClient, LLMResponseError, LLMUnavailableError
 from locpilot.security.secrets import redact
 from locpilot.storage.db import Database
+from locpilot.tools import git
 
 log = logging.getLogger("locpilot.runner")
 
@@ -102,6 +109,9 @@ class TaskManager:
         task = self._running.get(task_id)
         return task is not None and not task.done()
 
+    def any_running(self) -> bool:
+        return any(not t.done() for t in self._running.values())
+
     def user_command_running(self, task_id: str) -> bool:
         run = self._user_runs.get(task_id)
         return run is not None and not run.task.done()
@@ -134,6 +144,10 @@ class TaskManager:
             repo = self.db.get_repo(task["repo_id"])
             if repo is None:
                 raise KeyError(task["repo_id"])
+            try:
+                await ensure_task_worktree(self.settings, self.db, task)  # archived to free space: bring it back
+            except (WorkspaceError, git.GitError) as exc:
+                raise TaskConflictError(str(exc)) from exc
             user_runs = self._recent_user_runs(task_id, task["turn"])
             turn = task["turn"] + 1
             # The task is labelled "code" once it has (or is about to get) an isolated worktree.
@@ -250,6 +264,32 @@ class TaskManager:
         for turn in range(1, turns + 1):
             await saver.adelete_thread(f"{task_id}#{turn}")
 
+    async def compact_checkpoints(self, tasks: list[dict]) -> None:
+        """Free disk space: keep only what finished tasks still need from their saved agent state.
+
+        A follow-up message reads the newest checkpoint of the task's last turn, so for each given (idle) task
+        that one is kept and everything else goes — earlier turns, and the per-step history within the last turn.
+        Then the file is compacted so the space really returns to the disk.
+        """
+        saver = self.graph.checkpointer if self.graph is not None else None
+        if saver is None:
+            return
+        for task in tasks:
+            for turn in range(1, task["turn"]):
+                await saver.adelete_thread(f"{task['id']}#{turn}")
+        async with saver.lock:
+            for task in tasks:
+                thread = f"{task['id']}#{task['turn']}"
+                keep = ("SELECT max(checkpoint_id) FROM checkpoints c2 WHERE c2.thread_id = ? "
+                        "AND c2.checkpoint_ns = {t}.checkpoint_ns")
+                await saver.conn.execute(f"DELETE FROM writes WHERE thread_id = ? AND checkpoint_id != ({keep.format(t='writes')})",
+                                         (thread, thread))
+                await saver.conn.execute(
+                    f"DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_id != ({keep.format(t='checkpoints')})",
+                    (thread, thread))
+            await saver.conn.commit()
+            await saver.conn.execute("VACUUM")
+
     async def decide(self, task_id: str, approval_id: str, decision: dict) -> None:
         async with self._locks[task_id]:
             approval = self.db.get_approval(approval_id)
@@ -287,6 +327,10 @@ class TaskManager:
                                         "before running a command.")
             self._ensure_no_user_command(task_id)
             repo = self.db.get_repo(task["repo_id"])
+            try:
+                await ensure_task_worktree(self.settings, self.db, task)
+            except git.GitError as exc:
+                raise WorkspaceError(str(exc)) from exc
             worktree = task.get("worktree_path")
             if repo is None or not worktree or not Path(worktree).is_dir():
                 raise WorkspaceError("Commands run in this task's isolated worktree, which LocPilot creates in "

@@ -108,7 +108,7 @@ stateDiagram-v2
 | Node | Kind | Notes |
 |---|---|---|
 | `understand` | LLM (JSON) | intent, search terms, symbols, file hints, error strings, clarification need |
-| `inspect` | deterministic | inventory (respects `.gitignore` + exclusions), Tree-sitter/ast symbol index, manifests, test frameworks |
+| `inspect` | deterministic | inventory (respects `.gitignore` + exclusions), Tree-sitter/ast symbol index (on disk; shows progress on a first large index), manifests, test frameworks |
 | `seed_evidence` | deterministic | explicit paths → symbol definitions → callers → exact strings → BM25-style ranked windows → related tests |
 | `plan_evidence` | LLM (JSON) + tools | up to 4 read-only tool calls per round (`search_text`, `search_regex`, `find_definition`, `find_callers`, `read_file`, `list_directory`, `find_tests`, `git_log`), ≤ `MAX_EVIDENCE_ROUNDS` rounds |
 | `analyze` | LLM (JSON) | RCA: execution flow → suspicious lines → hypotheses → root cause; or explanation |
@@ -183,4 +183,11 @@ reconnects never lose history. Token progress and live command output are epheme
 | Desktop app | OS app-data dir passed by Tauri (macOS: `~/Library/Application Support/dev.locpilot.desktop`) |
 
 Inside: `locpilot.db`, `checkpoints.db`, `repos/` (clones), `worktrees/<task>`,
-`scratch/<task>` (sandbox temp/caches), `logs/`.
+`archived-worktrees/<task>.json` (worktrees archived to free space; restored on next use),
+`index/symbols.sqlite` (the code index, a cache), `scratch/<task>` (sandbox temp/caches), `logs/`.
+
+**Code index.** Symbols (definitions, call sites, imports) are kept in `index/symbols.sqlite`, not in
+memory, so a large repository costs disk rather than RAM (up to the inventory's 60,000 files). Each
+file's parse is stored once per content (language + hash): task worktrees reuse the parses of the main
+checkout, and after a restart only files that changed are parsed again. Folders that no longer exist
+and parses nothing refers to are dropped at startup.

@@ -549,3 +549,96 @@ def test_sse_stream_replays_and_resumes_after_reconnect(settings, tmp_path):
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+
+
+async def test_finished_worktrees_are_archived_to_free_space_and_restored_on_next_use(api, tmp_path):
+    app, client = await api(FakeLLM(hotel_script()))
+    repo = make_repo(tmp_path / "hotel", "hotel-offers")
+    rid = (await client.post("/api/repos", json={"source": "local", "path": str(repo)}, headers=H)).json()["id"]
+    task_id = (await client.post("/api/tasks", json={"repo_id": rid, "mode": "code", "message": "Fix duplicate offers"},
+                                 headers=H)).json()["id"]
+    manager = app.state.manager
+    for _ in range(600):
+        if not manager.is_running(task_id):
+            break
+        await asyncio.sleep(0.05)
+    detail = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert detail["status"] == "awaiting_approval"
+    worktree = Path(detail["worktree_path"])
+    # A task waiting for approval keeps its worktree.
+    listing = (await client.get("/api/storage")).json()
+    [row] = listing["worktrees"]
+    assert row["state"] == "active" and not row["can_archive"] and "approval" in row["reason"]
+    await client.post(f"/api/tasks/{task_id}/cancel", headers=H)
+    for _ in range(200):
+        if (await client.get(f"/api/tasks/{task_id}")).json()["status"] not in ("running", "awaiting_approval"):
+            break
+        await asyncio.sleep(0.05)
+    # The user's own edits in the worktree: a change, a new file, a deletion.
+    (worktree / "offers" / "aggregator.py").write_text("# edited\n" + (worktree / "offers" / "aggregator.py").read_text())
+    (worktree / "notes.txt").write_text("keep me\n")
+    (worktree / "README.md").unlink()
+    listing = (await client.get("/api/storage")).json()
+    assert listing["worktrees"][0]["can_archive"] and listing["archivable_bytes"] > 0
+
+    result = (await client.post("/api/storage/archive-worktrees", json={}, headers=H)).json()
+    assert result["archived"] == [task_id] and result["bytes_freed"] > 0
+    assert not worktree.exists()
+    assert (await client.get("/api/storage")).json()["worktrees"][0]["state"] == "archived"
+
+    # Opening the task's files brings the worktree back exactly as it was.
+    tree = await client.get(f"/api/repos/{rid}/tree", params={"task_id": task_id})
+    assert tree.status_code == 200
+    assert (worktree / "offers" / "aggregator.py").read_text().startswith("# edited\n")
+    assert (worktree / "notes.txt").read_text() == "keep me\n"
+    assert not (worktree / "README.md").exists()
+    assert (await client.get("/api/storage")).json()["worktrees"][0]["state"] == "active"
+
+    # Deleting an archived task removes its archive too.
+    await client.post("/api/storage/archive-worktrees", json={"task_ids": [task_id]}, headers=H)
+    archive = app.state.settings.data_dir / "archived-worktrees" / f"{task_id}.json"
+    assert archive.is_file()
+    assert (await client.delete(f"/api/tasks/{task_id}", headers=H)).status_code == 200
+    assert not archive.exists()
+
+
+async def test_clean_up_frees_disk_space_and_follow_ups_still_work(api, tmp_path):
+    app, client = await api(FakeLLM(hotel_script()))
+    repo = make_repo(tmp_path / "hotel", "hotel-offers")
+    rid = (await client.post("/api/repos", json={"source": "local", "path": str(repo)}, headers=H)).json()["id"]
+    task_id = (await client.post("/api/tasks", json={"repo_id": rid, "mode": "code", "message": "Fix duplicate offers"},
+                                 headers=H)).json()["id"]
+    manager = app.state.manager
+    for _ in range(600):
+        if not manager.is_running(task_id):
+            break
+        await asyncio.sleep(0.05)
+    approval = (await client.get(f"/api/tasks/{task_id}")).json()["pending_approval"]
+    await client.post(f"/api/tasks/{task_id}/approvals/{approval['id']}",
+                      json={"decision": "approve", "commands": [c["argv"] for c in approval["payload"]["commands"]]},
+                      headers=H)
+    for _ in range(600):
+        if not manager.is_running(task_id):
+            break
+        await asyncio.sleep(0.05)
+    task = (await client.get(f"/api/tasks/{task_id}")).json()
+    assert task["status"] == "completed"
+    settings = app.state.settings
+    (settings.logs_dir / "ollama.log").write_text("x" * 50_000)
+    (settings.logs_dir / "backend.log.1").write_text("old" * 10_000)
+    cache = settings.scratch_dir / task_id / "npm"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "blob").write_bytes(b"0" * 100_000)
+    carry_before = await manager._carry(task_id, task["turn"] + 1)
+
+    sizes = (await client.get("/api/storage")).json()
+    assert sizes["checkpoints_bytes"] > 0 and sizes["logs_bytes"] >= 80_000 and sizes["caches_bytes"] >= 100_000
+    result = (await client.post("/api/storage/clean-up", headers=H)).json()
+    assert result["details"]["logs"] >= 80_000 and result["details"]["caches"] >= 100_000
+    assert result["bytes_freed"] >= 180_000
+    assert (settings.logs_dir / "ollama.log").read_text() == "" and not (settings.logs_dir / "backend.log.1").exists()
+    assert not (settings.scratch_dir / task_id).exists()
+
+    # What a follow-up message needs from the last turn is kept.
+    carry_after = await manager._carry(task_id, task["turn"] + 1)
+    assert carry_after["history"] == carry_before["history"] and carry_after["report"] == carry_before["report"]

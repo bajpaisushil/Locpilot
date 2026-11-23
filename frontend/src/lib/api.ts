@@ -1,13 +1,16 @@
 import type {
   ApplyResult,
   ApprovalDecision,
+  ArchiveResult,
+  CleanUpResult,
   CommandOut,
   CommitResult,
   FileContent,
   HealthResponse,
+  Mode,
   ModelConfigUpdate,
   ModelStatus,
-  Mode,
+  PublishState,
   PullStatus,
   RepoCreate,
   RepoDetail,
@@ -15,13 +18,13 @@ import type {
   RollbackResult,
   SearchHit,
   SetupStatus,
+  StorageInfo,
   TaskDetail,
   TaskDiff,
   TaskSummary,
   TerminalOut,
   TreeEntry,
   WorktreeChanges,
-  PublishState,
 } from './types'
 
 /**
@@ -152,6 +155,12 @@ export const api = {
 
   modelStatus: () => request<ModelStatus>('GET', '/api/model/status'),
   updateModelConfig: (update: ModelConfigUpdate) => request<ModelStatus>('PUT', '/api/model/config', update),
+
+  storage: () => request<StorageInfo>('GET', '/api/storage'),
+  cleanUp: () => request<CleanUpResult>('POST', '/api/storage/clean-up', {}),
+  unloadModel: () => request<{ unloaded: string[] }>('POST', '/api/model/unload', {}),
+  archiveWorktrees: (taskIds?: string[]) =>
+    request<ArchiveResult>('POST', '/api/storage/archive-worktrees', taskIds ? { task_ids: taskIds } : {}),
 
   listRepos: () => request<RepoSummary[]>('GET', '/api/repos'),
   createRepo: (body: RepoCreate) => request<RepoDetail>('POST', '/api/repos', body),

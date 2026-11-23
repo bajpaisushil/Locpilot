@@ -81,6 +81,70 @@ export interface ModelStatus {
   hint: string | null
   /** The configured model that was missing, when LocPilot switched to this installed one by itself. */
   switched_from?: string | null
+  /** How the model fits in this machine's memory (only when the model is installed). */
+  memory?: ModelMemory | null
+}
+
+export interface ModelMemory {
+  total_bytes: number | null
+  /** RAM usable without pushing other programs into swap. */
+  available_bytes: number | null
+  /** What the model takes now (weights + context), when Ollama has it loaded. */
+  loaded_bytes: number | null
+  /** What loading it would take; 0 when it is already loaded. */
+  needed_bytes: number | null
+  /** Memory of the context window alone (estimated from the model's architecture). */
+  context_bytes: number | null
+  /** How Ollama stores the context: "q8_0" (8-bit, about half) when LocPilot started Ollama, else "f16". */
+  kv_cache_type: string
+  /** Loading the model would not fit in the free RAM: the machine would swap. */
+  short: boolean
+}
+
+// ---------------------------------------------------------------- storage
+
+export interface WorktreeUsage {
+  task_id: string
+  repo_id: string
+  repo_name: string | null
+  title: string
+  status: string
+  updated_at: string | null
+  /** "archived": saved to a small file to free space; restored automatically when the task is used again. */
+  state: 'active' | 'archived'
+  bytes: number
+  can_archive: boolean
+  /** Why it can't be archived right now. */
+  reason: string | null
+}
+
+export interface StorageInfo {
+  data_dir: string
+  worktrees: WorktreeUsage[]
+  worktrees_bytes: number
+  archivable_bytes: number
+  archived_count: number
+  archived_bytes: number
+  /** Tasks, messages, reports (SQLite). */
+  history_bytes: number
+  /** The agent's saved state after each step (resume, follow-ups). */
+  checkpoints_bytes: number
+  logs_bytes: number
+  /** Caches of commands run in task worktrees (npm, go build, tmp). */
+  caches_bytes: number
+  index_bytes: number
+  models_bytes: number | null
+}
+
+export interface CleanUpResult {
+  bytes_freed: number
+  details: Record<'history' | 'checkpoints' | 'logs' | 'caches' | 'index', number>
+}
+
+export interface ArchiveResult {
+  archived: string[]
+  skipped: { task_id: string; reason: string }[]
+  bytes_freed: number
 }
 
 export interface ModelConfigUpdate {

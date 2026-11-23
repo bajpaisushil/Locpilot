@@ -15,17 +15,18 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from locpilot import __version__
 from locpilot.agent.runner import TaskManager
-from locpilot.api import repos, setup, tasks, terminals
+from locpilot.api import repos, setup, storage, tasks, terminals
 from locpilot.config import Settings, get_settings
-from locpilot.llm.launcher import OllamaLauncher
+from locpilot.llm.launcher import OllamaLauncher, memory_saving_env
 from locpilot.llm.ollama import LLMClient, ModelUsage, OllamaClient
 from locpilot.security.http import LocalSecurityMiddleware
 from locpilot.storage.db import Database
+from locpilot.tools.symbols import configure_store
 from locpilot.tools.terminal import TerminalManager
 
 
-def default_llm_factory(settings: Settings, db: Database,
-                        usage: ModelUsage | None = None) -> Callable[[], OllamaClient]:
+def default_llm_factory(settings: Settings, db: Database, usage: ModelUsage | None = None,
+                        kv_cache_type: Callable[[], str] | None = None) -> Callable[[], OllamaClient]:
     def factory() -> OllamaClient:
         model = db.get_setting("model") or settings.model
         num_ctx = db.get_setting("num_ctx") or settings.num_ctx
@@ -34,7 +35,8 @@ def default_llm_factory(settings: Settings, db: Database,
                             temperature=settings.temperature if temperature is None else float(temperature),
                             timeout_s=settings.llm_timeout_s, seed=settings.llm_seed,
                             allow_remote=settings.allow_remote_ollama, keep_alive=settings.ollama_keep_alive,
-                            usage=usage, thinking_tokens=settings.thinking_tokens)
+                            usage=usage, thinking_tokens=settings.thinking_tokens,
+                            kv_cache_type=kv_cache_type() if kv_cache_type else "")
 
     return factory
 
@@ -43,8 +45,15 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     settings = settings or get_settings()
     settings.ensure_dirs()
     db = Database(settings.db_path)
+    configure_store(settings.symbol_index_path)  # the on-disk symbol index; also tidies it up
     usage = ModelUsage()  # models this run made Ollama load; freed again on quit
-    factory = llm_factory or default_llm_factory(settings, db, usage)
+    launcher_ref: list[OllamaLauncher] = []
+
+    def kv_cache_type() -> str:
+        """The context storage an Ollama LocPilot started uses (unknown for one the user runs)."""
+        return settings.ollama_kv_cache_type if launcher_ref and launcher_ref[0].owns_process else ""
+
+    factory = llm_factory or default_llm_factory(settings, db, usage, kv_cache_type)
     manager = TaskManager(settings, db, factory)
     terminal_manager = TerminalManager(shell=settings.terminal_shell, max_terminals=settings.max_terminals,
                                        scrollback_chars=settings.terminal_scrollback_chars)
@@ -52,7 +61,9 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     # Only the real Ollama client needs a running Ollama; tests inject a scripted model instead.
     launcher = OllamaLauncher(settings.ollama_url, settings.logs_dir,
                               enabled=settings.autostart_ollama and llm_factory is None,
-                              ollama_path=settings.ollama_path, start_timeout_s=settings.ollama_start_timeout_s)
+                              ollama_path=settings.ollama_path, start_timeout_s=settings.ollama_start_timeout_s,
+                              env_defaults=memory_saving_env(settings.ollama_kv_cache_type))
+    launcher_ref.append(launcher)
 
     async def release_models() -> None:
         """Free the RAM of the models LocPilot loaded. An Ollama LocPilot started is stopped anyway."""
@@ -129,4 +140,5 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     app.include_router(repos.router)
     app.include_router(tasks.router)
     app.include_router(terminals.router)
+    app.include_router(storage.router)
     return app

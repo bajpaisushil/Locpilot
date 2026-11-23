@@ -53,6 +53,13 @@ cannot think ignore the setting. With `LOCPILOT_DEBUG_LLM=true`, the reasoning i
 * The default `mimo-v2.6:9b-q4_K_M` uses about 5.8 GB of RAM with a 16k context (measured with
   `ollama ps` on an Apple M4); leave a couple of GB more free. Close heavy apps (Docker,
   browsers) or lower the context: Settings → context size, or `LOCPILOT_NUM_CTX=8192`.
+* Settings shows how much RAM the model uses (or would need) next to what is free, and a task logs a
+  warning when loading the model would not fit — that is when your computer would start swapping.
+  **Free RAM now** in Settings unloads the model at once; the next message loads it again.
+* When LocPilot starts Ollama itself it stores the context in 8 bits (`OLLAMA_KV_CACHE_TYPE=q8_0` with
+  flash attention): about half the context memory, no measurable quality loss. Your own `OLLAMA_*`
+  variables win; `LOCPILOT_OLLAMA_KV_CACHE_TYPE=""` turns it off. An Ollama you run yourself (or the
+  Ollama app) keeps its own settings — set those variables for it to get the same saving.
 * On 8 GB machines, lower the context as above, or try a smaller model such as
   `qwen2.5-coder:3b` (lower quality).
 * Expect 1–4 minutes for an Ask-mode investigation and 3–8 minutes for a Code-mode fix
@@ -130,3 +137,11 @@ An idle Ollama with no model loaded uses about 30 MB. To check or free memory by
 See "Data locations" in [architecture.md](architecture.md). Deleting a task removes
 LocPilot's worktree for it; your own repositories are never deleted (only clones that
 LocPilot made can be removed, and only when you ask).
+
+## LocPilot uses a lot of disk space
+
+Settings → Storage lists what takes space. **Free …** archives the worktrees (full checkouts) of
+finished tasks into small files; opening such a task again restores its worktree exactly, so nothing
+is lost. **Clean up** removes older saved agent states, command caches, logs and stale index entries,
+and compacts the databases — tasks, their history and follow-up messages keep working. The code index
+(`<data dir>/index/symbols.sqlite`) is a cache and can be deleted while LocPilot is closed.

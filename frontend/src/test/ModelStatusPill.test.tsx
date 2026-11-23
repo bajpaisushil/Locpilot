@@ -33,3 +33,17 @@ describe('ModelStatusPill', () => {
     expect(await screen.findByText('Backend error', {}, { timeout: 4000 })).toBeInTheDocument()
   })
 })
+
+describe('ModelStatusPill memory', () => {
+  it('shows the RAM the loaded model uses, and warns when memory is short', async () => {
+    const GB = 1024 ** 3
+    mockFetch({
+      'GET /api/model/status': modelStatus({
+        memory: { total_bytes: 16 * GB, available_bytes: 7 * GB, loaded_bytes: 5.8 * GB, needed_bytes: 0,
+                  context_bytes: GB, kv_cache_type: 'q8_0', short: false },
+      }),
+    })
+    renderWithProviders(<ModelStatusPill />)
+    expect(await screen.findByTestId('model-ram')).toHaveTextContent('5.8 GB')
+  })
+})

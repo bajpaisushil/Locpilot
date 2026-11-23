@@ -247,6 +247,21 @@ async def model_status(request: Request) -> dict:
     return await model_status_with_fallback(request)
 
 
+@router.post("/model/unload")
+async def unload_model(request: Request) -> dict:
+    """Free the model's RAM now (instead of after the idle timeout). The next message loads it again."""
+    if request.app.state.manager.any_running():
+        raise ApiError(409, "task_busy", "LocPilot is working on a task; wait for it to finish first.")
+    client = request.app.state.llm_factory()
+    if not isinstance(client, OllamaClient):
+        return {"unloaded": []}
+    usage = request.app.state.model_usage
+    unloaded = await client.unload_models(sorted({client.model, *usage.loaded}))
+    for model in unloaded:
+        usage.forget(model)
+    return {"unloaded": unloaded}
+
+
 @router.put("/model/config")
 async def model_config(body: ModelConfigUpdate, request: Request) -> dict:
     db = db_of(request)

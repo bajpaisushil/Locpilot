@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
 
+from locpilot.agent.workspace import WorkspaceError, archive_path, ensure_task_worktree
 from locpilot.api.models import ApiError, FileWrite, RepoCreate, db_of, manager_of, settings_of
 from locpilot.repos import RepoValidationError, register_local, register_remote
 from locpilot.security.paths import PathSecurityError, is_within, safe_join
@@ -16,6 +17,7 @@ from locpilot.tools.files import MAX_VIEW_BYTES, drop_index, get_index, monaco_l
 from locpilot.tools.manifests import inspect_project
 from locpilot.tools.patch import atomic_write
 from locpilot.tools.search import SearchError, search
+from locpilot.tools.symbols import forget_symbols
 
 router = APIRouter(prefix="/api/repos")
 
@@ -86,18 +88,25 @@ async def delete_repo(repo_id: str, request: Request, delete_clone: bool = False
                                         managed_root=settings.worktrees_dir)
             except git.GitError:
                 pass
+            forget_symbols(Path(task["worktree_path"]))
+        archive_path(settings, task["id"]).unlink(missing_ok=True)
     db.delete_repo(repo_id)
     drop_index(Path(repo["path"]))
+    forget_symbols(Path(repo["path"]))
     if delete_clone and repo["managed"] and is_within(settings.repos_dir, Path(repo["path"])):
         await asyncio.to_thread(shutil.rmtree, repo["path"], True)
     return {"ok": True}
 
 
-def _root_for(request: Request, repo: dict, task_id: str | None) -> Path:
+async def _root_for(request: Request, repo: dict, task_id: str | None) -> Path:
     if task_id:
         task = db_of(request).get_task(task_id)
         if task is None or task["repo_id"] != repo["id"]:
             raise ApiError(404, "task_not_found", "Task not found for this repository.")
+        try:
+            await ensure_task_worktree(settings_of(request), db_of(request), task)  # archived to free space
+        except (WorkspaceError, git.GitError) as exc:
+            raise ApiError(409, "worktree_restore_failed", str(exc)) from exc
         if task.get("worktree_path") and Path(task["worktree_path"]).is_dir():
             return Path(task["worktree_path"])
     return Path(repo["path"])
@@ -106,7 +115,7 @@ def _root_for(request: Request, repo: dict, task_id: str | None) -> Path:
 @router.get("/{repo_id}/tree")
 async def tree(repo_id: str, request: Request, path: str = "", task_id: str | None = None) -> list[dict]:
     repo = _repo_or_404(request, repo_id)
-    root = _root_for(request, repo, task_id)
+    root = await _root_for(request, repo, task_id)
     try:
         return await asyncio.to_thread(lambda: get_index(root).list_dir(path))
     except PathSecurityError as exc:
@@ -117,7 +126,7 @@ async def tree(repo_id: str, request: Request, path: str = "", task_id: str | No
 async def read_file(repo_id: str, request: Request, path: str, start: int | None = Query(None, ge=1),
                     end: int | None = Query(None, ge=1), task_id: str | None = None) -> dict:
     repo = _repo_or_404(request, repo_id)
-    root = _root_for(request, repo, task_id)
+    root = await _root_for(request, repo, task_id)
     try:
         full = safe_join(root, path)
     except PathSecurityError as exc:
@@ -147,7 +156,7 @@ async def write_file(repo_id: str, body: FileWrite, request: Request) -> dict:
     silently overwrites a change made meanwhile (by LocPilot, a terminal or another editor).
     """
     repo = _repo_or_404(request, repo_id)
-    root = _root_for(request, repo, body.task_id)
+    root = await _root_for(request, repo, body.task_id)
     if body.task_id and root != Path(repo["path"]) and manager_of(request).is_running(body.task_id):
         raise ApiError(409, "task_busy", "LocPilot is editing this worktree right now. Save again when it finishes.")
     try:
@@ -176,7 +185,7 @@ async def write_file(repo_id: str, body: FileWrite, request: Request) -> dict:
 async def search_repo(repo_id: str, request: Request, q: str = Query(min_length=1, max_length=300),
                       regex: bool = False, task_id: str | None = None) -> list[dict]:
     repo = _repo_or_404(request, repo_id)
-    root = _root_for(request, repo, task_id)
+    root = await _root_for(request, repo, task_id)
     try:
         result = await asyncio.to_thread(lambda: search(get_index(root), q, is_regex=regex, max_results=200))
     except SearchError as exc:

@@ -16,6 +16,7 @@ export const qk = {
   command: (taskId: string, commandId: string) => ['task', taskId, 'command', commandId] as const,
   worktreeChanges: (id: string) => ['task', id, 'worktree-changes'] as const,
   terminals: (repoId: string) => ['terminals', repoId] as const,
+  storage: ['storage'] as const,
 }
 
 export const ACTIVE_STATUSES: TaskStatus[] = ['queued', 'running']
@@ -41,6 +42,11 @@ export function useModelStatus() {
     queryFn: api.modelStatus,
     refetchInterval: (query) => (query.state.data?.model_available ? 30_000 : 5_000),
   })
+}
+
+/** Disk space LocPilot uses (walks the worktrees, so only fetched while someone looks at it). */
+export function useStorage(enabled: boolean) {
+  return useQuery({ queryKey: qk.storage, queryFn: api.storage, enabled, staleTime: 10_000 })
 }
 
 export function useRepos() {

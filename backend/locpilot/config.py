@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # LocPilot also unloads it when LocPilot quits or you switch models.
     ollama_keep_alive: str = "30m"
     num_ctx: int = 16384
+    # How an Ollama server that LocPilot starts stores the context (KV cache): "q8_0" uses about half the memory of
+    # Ollama's default with no measurable quality loss — what makes 16 GB machines comfortable. "" = Ollama's default.
+    # An Ollama you run yourself (or the Ollama app) keeps its own settings; your OLLAMA_* variables always win.
+    ollama_kv_cache_type: Literal["q8_0", "q4_0", "f16", ""] = "q8_0"
     # Thinking models (MiMo, Qwen3, …) can reason before they answer, which they do by default. "off" tells them not
     # to: in LocPilot's benchmark it was faster and no less accurate. "auto" thinks only in the root-cause analysis
     # and failure diagnosis; "on" in every step. Models that cannot think ignore this.
@@ -91,6 +95,9 @@ class Settings(BaseSettings):
     max_evidence_rounds: int = 2
     max_patch_attempts: int = 2
     max_evidence_chars: int = 26_000
+    # LOCPILOT.md in the repository root: the owner's notes (test commands, conventions, folders not to touch) given
+    # to the model in every step. Capped so it never crowds out the code on small machines.
+    project_notes_chars: int = Field(default=1500, ge=0, le=8000)
 
     @field_validator("allowed_origins", "allowed_git_hosts", mode="before")
     @classmethod
@@ -141,6 +148,11 @@ class Settings(BaseSettings):
     @property
     def worktrees_dir(self) -> Path:
         return self.data_dir / "worktrees"
+
+    @property
+    def symbol_index_path(self) -> Path:
+        """Parsed symbols of every indexed folder (a cache: safe to delete)."""
+        return self.data_dir / "index" / "symbols.sqlite"
 
     @property
     def scratch_dir(self) -> Path:

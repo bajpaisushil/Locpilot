@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from locpilot.agent.graph import compute_verification, failure_signature
+from locpilot.agent.graph import compute_verification, failure_signature, load_project_notes
 from locpilot.app import create_app
 from tests.conftest import FIXTURES, FakeLLM, git, hotel_script, make_repo
 
@@ -102,6 +102,36 @@ async def test_ask_mode_rca_is_read_only_and_citations_are_validated(settings, t
         assert h.db.list_commands(task_id) == [] and h.db.list_patches(task_id) == []
         assert task["worktree_path"] is None
     assert snapshot(repo_path) == before
+
+
+async def test_project_notes_reach_every_step_redacted(settings, tmp_path):
+    token = "ghp_" + "a" * 36
+    notes = f"Run tests with: python -m unittest\nMoney is stored in integer cents.\nCI token: {token}\n"
+    repo_path = make_repo(tmp_path / "hotel", "hotel-offers", files={"LOCPILOT.md": notes})
+    fake = FakeLLM(rca_only_script())
+    seen: list[str] = []
+    chat = fake.chat
+
+    async def spy(messages, **kw):
+        seen.append(messages[1]["content"])
+        return await chat(messages, **kw)
+
+    fake.chat = spy
+    async with Harness(settings, fake) as h:
+        task_id = await h.start(h.add_repo(repo_path), "ask", "Find the root cause of duplicate hotel offers")
+        await h.wait(task_id)
+        logs = [e["data"]["text"] for e in h.db.list_events(task_id) if e["type"] == "log"]
+    assert seen and all("Money is stored in integer cents." in p for p in seen)
+    assert not any(token in p for p in seen)  # secrets never reach the model
+    assert any("LOCPILOT.md" in text for text in logs)
+
+
+def test_project_notes_are_capped_and_optional(tmp_path):
+    assert load_project_notes(tmp_path, 1500) == ("", None)
+    (tmp_path / "LOCPILOT.md").write_text("\n".join(f"line {i}: keep this short" for i in range(200)))
+    text, notice = load_project_notes(tmp_path, 300)
+    assert len(text) <= 304 and text.endswith("[…]") and "first" in notice
+    assert load_project_notes(tmp_path, 0) == ("", None)  # turned off
 
 
 async def test_ask_mode_fix_request_does_not_modify_anything(settings, tmp_path):

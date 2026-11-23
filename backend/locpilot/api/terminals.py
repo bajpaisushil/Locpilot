@@ -12,8 +12,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from locpilot.agent.workspace import project_tool_env
-from locpilot.api.models import ApiError, db_of
+from locpilot.agent.workspace import WorkspaceError, ensure_task_worktree, project_tool_env
+from locpilot.api.models import ApiError, db_of, settings_of
+from locpilot.tools import git
 from locpilot.tools.terminal import TerminalError, TerminalManager, TerminalSession
 
 router = APIRouter(prefix="/api/terminals")
@@ -72,6 +73,10 @@ async def open_terminal(body: TerminalCreate, request: Request) -> dict:
         task = db.get_task(body.task_id)
         if task is None or task["repo_id"] != repo["id"]:
             raise ApiError(404, "task_not_found", "Task not found for this repository.")
+        try:
+            await ensure_task_worktree(settings_of(request), db, task)  # archived to free space: bring it back
+        except (WorkspaceError, git.GitError) as exc:
+            raise ApiError(409, "worktree_restore_failed", str(exc)) from exc
         worktree = task.get("worktree_path")
         if worktree and Path(worktree).is_dir():
             cwd, location, title = Path(worktree), "worktree", f"{repo['name']} · {task['title'][:40]}"

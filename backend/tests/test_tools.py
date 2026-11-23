@@ -14,7 +14,7 @@ from locpilot.tools.patch import (
     revert_changes,
 )
 from locpilot.tools.search import SearchError, search
-from locpilot.tools.symbols import SymbolIndex
+from locpilot.tools.symbols import SymbolIndex, SymbolStore
 from locpilot.tools.testparse import parse_test_output
 from tests.conftest import make_repo
 
@@ -65,6 +65,44 @@ def test_symbols_definitions_callers_and_chain(hotel_repo):
                                             "MergeOffersTest.test_different_products_are_kept")
     assert symbols.enclosing("offers/aggregator.py", 15).name == "merge_offers"
     assert any(path == "offers/search.py" for path, _, _ in symbols.importers_of("offers/aggregator.py"))
+
+
+def test_symbol_index_is_stored_on_disk_and_reused(hotel_repo, tmp_path):
+    db = tmp_path / "index" / "symbols.sqlite"
+    index = RepoIndex(hotel_repo)
+    index.refresh(force=True)
+    first = SymbolIndex(index, SymbolStore(db)).build()
+    assert first.parsed_now > 0 and first.definitions("merge_offers")
+
+    # After a restart (a new store on the same file) nothing is parsed again.
+    again = SymbolIndex(RepoIndex(hotel_repo), SymbolStore(db))
+    again.index.refresh(force=True)
+    again.build()
+    assert again.parsed_now == 0 and again.symbol_count == first.symbol_count
+    assert again.definitions("merge_offers")[0].path == "offers/aggregator.py"
+
+    # A copy of the repository (like a task worktree) reuses the parses: same content, nothing to parse.
+    copy = tmp_path / "copy"
+    git.worktree_add(hotel_repo, copy, git.head_commit(hotel_repo), hooks_dir=tmp_path / "hooks")
+    store = SymbolStore(db)
+    other = SymbolIndex(RepoIndex(copy), store)
+    other.index.refresh(force=True)
+    other.build()
+    assert other.parsed_now == 0 and other.definitions("merge_offers")[0].path == "offers/aggregator.py"
+
+    # Edits and deletions are picked up; only the changed file is parsed.
+    (copy / "offers" / "aggregator.py").write_text("def merged_offers_v2(items):\n    return items\n")
+    (copy / "offers" / "search.py").unlink()
+    other.index.refresh(force=True)
+    other.build()
+    assert other.parsed_now == 1
+    assert other.definitions("merged_offers_v2") and not other.definitions("search_hotels")
+    assert SymbolIndex(index, store).definitions("merge_offers")  # the main checkout is unaffected
+
+    # Removing the copy and collecting garbage forgets it and the parses only it used.
+    git.worktree_remove(hotel_repo, copy, managed_root=tmp_path)
+    assert store.collect_garbage() == {"roots_removed": 1, "parses_removed": 1}
+    assert SymbolIndex(index, store).definitions("merge_offers")
 
 
 def test_manifest_detection_python_and_node(hotel_repo, tmp_path):

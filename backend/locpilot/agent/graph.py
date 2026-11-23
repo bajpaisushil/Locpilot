@@ -94,6 +94,7 @@ class AgentState(TypedDict, total=False):
     task_id: str
     repo_id: str
     repo_path: str
+    project_notes: str  # LOCPILOT.md, read again at the start of every turn
     turn: int
     mode: str
     request: str
@@ -160,6 +161,45 @@ class AgentDeps:
     db: Database
     llm: Any  # Callable[[], LLMClient]
     emitter: Any  # Callable[[task_id, turn, type, data, persist], Awaitable[dict]]
+
+
+PROJECT_NOTES_FILE = "LOCPILOT.md"
+
+
+def load_project_notes(repo_path: Path, limit: int) -> tuple[str, str | None]:
+    """The repository owner's LOCPILOT.md (secrets redacted, at most ``limit`` characters) and a line for the
+    timeline saying it is used; ("", None) when there is none."""
+    path = repo_path / PROJECT_NOTES_FILE
+    if limit <= 0 or not path.is_file() or path.is_symlink():
+        return "", None
+    try:
+        raw = path.read_bytes()[:200_000].decode("utf-8", errors="replace")
+    except OSError:
+        return "", None
+    text = redact(raw).strip()
+    if not text:
+        return "", None
+    if len(text) <= limit:
+        return text, f"Using your project notes from {PROJECT_NOTES_FILE} ({len(text):,} characters)."
+    cut = text[:limit]
+    cut = cut[: cut.rfind("\n")] if "\n" in cut else cut
+    return (cut.rstrip() + "\n[…]",
+            f"Using the first {len(cut):,} of {len(text):,} characters of {PROJECT_NOTES_FILE}; keep it short "
+            "(about 1,500 characters) so it fits small models.")
+
+
+def _gb(n: int | float) -> str:
+    return f"{n / 2**30:.1f} GB"
+
+
+def memory_warning(mem: dict | None) -> str | None:
+    """The text shown when the model would not fit in the RAM that is free (see OllamaClient.memory_check)."""
+    if not mem or not mem.get("short"):
+        return None
+    context = f", of which {_gb(mem['context_bytes'])} for the context" if mem.get("context_bytes") else ""
+    return (f"Only {_gb(mem['available_bytes'])} of memory is free, but the model needs about "
+            f"{_gb(mem['needed_bytes'])}{context}. Your computer may start swapping, which makes answers much slower. "
+            "Close other apps, or pick a smaller model or a smaller context window in Settings.")
 
 
 def turn_input(carry: dict, *, task_id: str, repo: dict, turn: int, mode: str, request: str,
@@ -375,7 +415,8 @@ class LocPilotGraph:
                             for h in (state.get("history") or [])[-4:])
         evidence = render_evidence(state.get("evidence") or [], max_lines_per_item=evidence_lines) if with_evidence else ""
         user_runs = self._runs_text(state["user_runs"])[:3500] if with_user_runs and state.get("user_runs") else ""
-        return prompts.context_block(summary, evidence, state.get("notes") or [], history, user_runs)
+        return prompts.context_block(summary, evidence, state.get("notes") or [], history, user_runs,
+                                     state.get("project_notes") or "")
 
     # nodes --------------------------------------------------------------------------
     async def start_turn(self, state: AgentState) -> dict:
@@ -399,7 +440,26 @@ class LocPilotGraph:
         updates["workspace_path"] = workspace
         if not state.get("worktree_path") and not updates.get("worktree_path"):
             self.db.update_task(state["task_id"], workspace_path=workspace)
+        notes, notice = await asyncio.to_thread(load_project_notes, Path(state["repo_path"]),
+                                                self.settings.project_notes_chars)
+        updates["project_notes"] = notes
+        if notice:
+            await self.log(state, notice)
+        warning = await self._memory_warning()
+        if warning:
+            await self.log(state, warning, level="warning")
         return updates
+
+    async def _memory_warning(self) -> str | None:
+        """A warning when loading the model would not fit in the free RAM (the machine would swap: very slow)."""
+        check = getattr(self.deps.llm(), "memory_check", None)
+        if check is None:
+            return None
+        try:
+            mem = await check()
+        except Exception:  # noqa: BLE001 - only advice: never fail a turn over it
+            return None
+        return memory_warning(mem)
 
     def route_after_start(self, state: AgentState) -> str:
         return "finalize" if state.get("final_status") == "failed" else "understand"
@@ -452,11 +512,26 @@ class LocPilotGraph:
     async def inspect(self, state: AgentState) -> dict:
         await self.phase(state, "inspect", "Inspecting repository structure")
 
+        loop = asyncio.get_running_loop()
+        last_report = [0.0]
+
+        def progress(done: int, total: int) -> None:
+            # Only a first look at a big repository takes long enough to be worth reporting; parses are stored.
+            now = time.monotonic()
+            if total < 400 or (now - last_report[0] < 1.5 and done < total):
+                return
+            last_report[0] = now
+            detail = f"Indexing code: {done:,} of {total:,} files (stored, so this is faster next time)"
+            asyncio.run_coroutine_threadsafe(self.emit(state, "phase", {
+                "phase": "inspect", "label": "Inspecting repository structure", "state": "started",
+                "detail": detail}, persist=False), loop)
+
         def work() -> dict:
             index = self.index(state)
             index.refresh(force=True)
-            symbols = get_symbol_index(index)
-            return {"files": len(index.files), "symbols": symbols.symbol_count, "truncated": index.truncated}
+            symbols = get_symbol_index(index, progress)
+            return {"files": len(index.files), "symbols": symbols.symbol_count,
+                    "truncated": index.truncated or symbols.truncated}
 
         info = await asyncio.to_thread(work)
         ov = state.get("overview") or {}
@@ -734,6 +809,8 @@ class LocPilotGraph:
                          allowed_new: set[str], only_tests: bool = False, attempts: int = 2,
                          protected: set[str] | None = None):
         """Ask for SEARCH/REPLACE edits, validate them, and feed errors back (bounded)."""
+        if state.get("project_notes"):  # the owner's conventions matter most when writing code
+            prompt = prompts.project_notes_block(state["project_notes"]) + "\n\n" + prompt
         messages = [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": prompt}]
         usage = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
         build = None

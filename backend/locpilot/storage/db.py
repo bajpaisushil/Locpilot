@@ -168,6 +168,12 @@ class Database:
         with self._lock:
             self._conn.close()
 
+    def compact(self) -> None:
+        """Give the space of deleted rows back to the disk (and fold the write-ahead log into the file)."""
+        with self._lock:
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def _exec(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:
         with self._lock:
             return self._conn.execute(sql, params)

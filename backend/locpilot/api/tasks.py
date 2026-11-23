@@ -13,7 +13,7 @@ from fastapi import APIRouter, Header, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from locpilot.agent.runner import TaskConflictError
-from locpilot.agent.workspace import WorkspaceError
+from locpilot.agent.workspace import WorkspaceError, archive_path, ensure_task_worktree
 from locpilot.api.models import (
     ApiError,
     ApprovalDecision,
@@ -33,6 +33,7 @@ from locpilot.storage.db import now_iso
 from locpilot.tools import git
 from locpilot.tools.files import drop_index
 from locpilot.tools.patch import FileChange, revert_changes, unified_diff
+from locpilot.tools.symbols import forget_symbols
 
 router = APIRouter(prefix="/api/tasks")
 
@@ -114,6 +115,8 @@ async def delete_task(task_id: str, request: Request) -> dict:
         except git.GitError:
             pass
         drop_index(Path(task["worktree_path"]))
+        forget_symbols(Path(task["worktree_path"]))
+    archive_path(settings, task_id).unlink(missing_ok=True)  # a worktree archived to free space
     await manager.forget(task_id, task["turn"])  # LangGraph checkpoints for every turn of this task
     scratch = settings.scratch_dir / task_id
     if scratch.is_dir() and scratch.resolve().is_relative_to(settings.scratch_dir.resolve()):
@@ -220,6 +223,7 @@ def _applied_changes(request: Request, task_id: str) -> list[FileChange]:
 @router.get("/{task_id}/diff")
 async def task_diff(task_id: str, request: Request) -> dict:
     task = _task_or_404(request, task_id)
+    await _restore_worktree(request, task)
     worktree = task.get("worktree_path")
     files = []
     if worktree and Path(worktree).is_dir():
@@ -282,6 +286,7 @@ async def rollback(task_id: str, request: Request) -> dict:
         raise ApiError(409, "task_busy", "Cancel the running turn before rolling back.")
     if manager.user_command_running(task_id):
         raise ApiError(409, "task_busy", "Stop the command you are running before rolling back.")
+    await _restore_worktree(request, task)
     worktree = task.get("worktree_path")
     if not worktree or not Path(worktree).is_dir():
         raise ApiError(400, "no_worktree", "This task has no LocPilot worktree to roll back.")
@@ -301,7 +306,16 @@ async def rollback(task_id: str, request: Request) -> dict:
 
 # --- bringing a task's changes out: apply to the user's checkout, commit to a branch, push --------------
 
-def _worktree_or_400(task: dict) -> Path:
+async def _restore_worktree(request: Request, task: dict) -> None:
+    """Bring back a worktree that was archived to free disk space, before an endpoint reads it."""
+    try:
+        await ensure_task_worktree(settings_of(request), db_of(request), task)
+    except (WorkspaceError, git.GitError) as exc:
+        raise ApiError(409, "worktree_restore_failed", str(exc)) from exc
+
+
+async def _worktree_or_400(request: Request, task: dict) -> Path:
+    await _restore_worktree(request, task)
     worktree = task.get("worktree_path")
     if not worktree or not Path(worktree).is_dir():
         raise ApiError(400, "no_worktree", "This task has no LocPilot worktree (changes are made in Code mode).")
@@ -367,7 +381,7 @@ def _git_hint(message: str) -> str | None:
 async def worktree_changes(task_id: str, request: Request) -> dict:
     """Uncommitted changes in the task worktree (LocPilot's and any others), plus commit/push state."""
     task = _task_or_404(request, task_id)
-    worktree = _worktree_or_400(task)
+    worktree = await _worktree_or_400(request, task)
     files = await asyncio.to_thread(git.worktree_changes, worktree)
     ours = {c.path for c in _applied_changes(request, task_id)}
     publish = await asyncio.to_thread(_publish_view, request, task, worktree)
@@ -387,7 +401,7 @@ async def apply_to_repo(task_id: str, body: FileSelection, request: Request) -> 
     """Write the selected changes into the user's own working tree (plain file edits, explicit user action)."""
     db, settings = db_of(request), settings_of(request)
     task = _task_or_404(request, task_id)
-    worktree = _worktree_or_400(task)
+    worktree = await _worktree_or_400(request, task)
     _ensure_idle(request, task_id)
     repo = db.get_repo(task["repo_id"])
     if repo is None or not task.get("base_commit"):
@@ -409,7 +423,7 @@ async def commit_changes(task_id: str, body: CommitCreate, request: Request) -> 
     """Commit the selected worktree changes to a branch (created or advanced; the worktree stays detached)."""
     db, settings = db_of(request), settings_of(request)
     task = _task_or_404(request, task_id)
-    worktree = _worktree_or_400(task)
+    worktree = await _worktree_or_400(request, task)
     _ensure_idle(request, task_id)
     if not await asyncio.to_thread(git.valid_branch_name, body.branch):
         raise ApiError(400, "invalid_branch", f"{body.branch!r} is not a valid branch name.")
@@ -433,7 +447,7 @@ async def push_changes(task_id: str, request: Request) -> dict:
     """Push the task's branch to origin with the user's own Git credentials."""
     db, settings = db_of(request), settings_of(request)
     task = _task_or_404(request, task_id)
-    worktree = _worktree_or_400(task)
+    worktree = await _worktree_or_400(request, task)
     publish = db.get_publish(task_id)
     if publish is None:
         raise ApiError(400, "nothing_committed", "Commit the changes to a branch before pushing.")

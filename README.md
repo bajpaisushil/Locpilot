@@ -51,6 +51,15 @@ cloud model fallback.
   exclusions, literal and regex search, Tree-sitter (JS/TS/Go/Java/Rust) and `ast` (Python)
   symbols, callers/callees and static call chains, imports, manifests and test-runner
   detection, `git log`/blame.
+* **Project notes** — put a short `LOCPILOT.md` in your repository root (test commands, conventions,
+  folders not to touch); LocPilot gives it to the model in every step (about 1,500 characters at most,
+  secrets redacted).
+* **Made for 16 GB machines** — an Ollama that LocPilot starts stores the context in 8 bits (about half
+  the memory); Settings shows the RAM the model uses next to what is free, warns before it would make
+  your computer swap, and has **Free RAM now**. The code index lives on disk (`index/symbols.sqlite`),
+  so big repositories cost disk, not RAM, and nothing is parsed twice. **Settings → Storage** frees
+  disk space: archive finished tasks' worktrees (restored automatically when used again) and clean up
+  old agent states, caches and logs.
 * **Persistent history** — tasks, messages, timelines, reports, diffs and command outputs
   are stored in SQLite; LangGraph checkpoints let interrupted tasks resume after a restart
   without re-applying edits.

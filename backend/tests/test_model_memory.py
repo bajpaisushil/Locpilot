@@ -139,3 +139,76 @@ def test_keep_alive_must_be_a_duration():
     assert Settings(ollama_keep_alive="0").ollama_keep_alive == "0"
     with pytest.raises(ValidationError):
         Settings(ollama_keep_alive="until I quit")
+
+
+# --- Does the model fit? ------------------------------------------------------------------------------------
+
+LLAMA_8B_INFO = {"general.architecture": "llama", "llama.block_count": 32, "llama.attention.head_count": 32,
+                 "llama.attention.head_count_kv": 8, "llama.embedding_length": 4096}
+
+
+def test_context_memory_is_estimated_from_the_model_architecture():
+    from locpilot.llm.ollama import kv_cache_bytes
+
+    f16 = kv_cache_bytes(LLAMA_8B_INFO, 16384, "f16")
+    assert f16 == 32 * 8 * (128 + 128) * 16384 * 2  # 2 GiB: the well-known figure for 8B Llama at 16k
+    q8 = kv_cache_bytes(LLAMA_8B_INFO, 16384, "q8_0")
+    assert 0.5 < q8 / f16 < 0.55  # 8-bit storage: about half
+    assert kv_cache_bytes({"general.architecture": "x"}, 16384) is None  # unknown architecture: no guess
+
+
+def test_available_memory_is_read_on_this_machine():
+    from locpilot.llm.ollama import available_memory, physical_memory
+
+    avail, total = available_memory(), physical_memory()
+    assert total and avail and 0 < avail <= total
+
+
+async def test_low_memory_is_reported_before_the_model_is_loaded(monkeypatch):
+    from locpilot.agent.graph import memory_warning
+    from locpilot.llm import ollama as ollama_mod
+    from locpilot.llm.ollama import OllamaClient
+
+    client = OllamaClient("http://127.0.0.1:11434", "big:8b", num_ctx=16384, kv_cache_type="q8_0")
+
+    async def loaded_details():
+        return []
+
+    async def list_models():
+        return [{"name": "big:8b", "size_bytes": 5 * 2**30}]
+
+    async def show():
+        return {"model_info": LLAMA_8B_INFO, "capabilities": ["completion"]}
+
+    monkeypatch.setattr(client, "loaded_details", loaded_details)
+    monkeypatch.setattr(client, "list_models", list_models)
+    monkeypatch.setattr(client, "_show", show)
+    monkeypatch.setattr(ollama_mod, "available_memory", lambda: 4 * 2**30)
+    mem = await client.memory_check()
+    assert mem["short"] and mem["needed_bytes"] > 6 * 2**30 and mem["kv_cache_type"] == "q8_0"
+    text = memory_warning(mem)
+    assert "Only 4.0 GB of memory is free" in text and "for the context" in text
+
+    monkeypatch.setattr(ollama_mod, "available_memory", lambda: 12 * 2**30)
+    assert memory_warning(await client.memory_check()) is None  # it fits: say nothing
+
+    async def loaded_now():
+        return [{"name": "big:8b", "size_bytes": 6 * 2**30, "vram_bytes": 0, "context_length": 16384}]
+
+    monkeypatch.setattr(client, "loaded_details", loaded_now)
+    monkeypatch.setattr(ollama_mod, "available_memory", lambda: 1 * 2**30)
+    mem = await client.memory_check()
+    assert mem["needed_bytes"] == 0 and mem["loaded_bytes"] == 6 * 2**30 and not mem["short"]  # already loaded
+
+
+async def test_free_ram_now_unloads_the_model_but_not_other_programs_models(settings, ollama):
+    app, client, cm = await started_app(settings, ollama_url=ollama.url, autostart_ollama=True,
+                                        ollama_path=ollama.binary)
+    try:
+        await app.state.llm_factory().chat([{"role": "user", "content": "hi"}], max_tokens=8)
+        assert "mimo-v2.6:9b-q4_K_M" in ollama.loaded()
+        r = await client.post("/api/model/unload", headers=H)
+        assert r.status_code == 200 and r.json()["unloaded"] == ["mimo-v2.6:9b-q4_K_M"]
+        assert ollama.loaded() == ["llama3.2:3b"]  # another program's model stays
+    finally:
+        await stop_app(client, cm)
