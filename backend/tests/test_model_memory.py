@@ -164,12 +164,14 @@ def test_available_memory_is_read_on_this_machine():
     assert total and avail and 0 < avail <= total
 
 
-async def test_low_memory_is_reported_before_the_model_is_loaded(monkeypatch):
+async def test_low_memory_is_reported_before_the_model_is_loaded(monkeypatch, tmp_path):
     from locpilot.agent.graph import memory_warning
     from locpilot.llm import ollama as ollama_mod
-    from locpilot.llm.ollama import OllamaClient
+    from locpilot.llm.ollama import ModelUsage, OllamaClient
 
-    client = OllamaClient("http://127.0.0.1:11434", "big:8b", num_ctx=16384, kv_cache_type="q8_0")
+    sizes = tmp_path / "model-sizes.json"
+    client = OllamaClient("http://127.0.0.1:11434", "big:8b", num_ctx=16384, kv_cache_type="q8_0",
+                          usage=ModelUsage(sizes_path=sizes))
 
     async def loaded_details():
         return []
@@ -199,6 +201,30 @@ async def test_low_memory_is_reported_before_the_model_is_loaded(monkeypatch):
     monkeypatch.setattr(ollama_mod, "available_memory", lambda: 1 * 2**30)
     mem = await client.memory_check()
     assert mem["needed_bytes"] == 0 and mem["loaded_bytes"] == 6 * 2**30 and not mem["short"]  # already loaded
+
+    # Unloaded again: the next estimate is what it really took, not the file size + context guess, and that is
+    # remembered across restarts.
+    monkeypatch.setattr(client, "loaded_details", loaded_details)
+    monkeypatch.setattr(ollama_mod, "available_memory", lambda: 12 * 2**30)
+    assert (await client.memory_check())["needed_bytes"] == 6 * 2**30
+    assert ModelUsage(sizes_path=sizes).sizes == {"big:8b|16384|q8_0": 6 * 2**30}
+
+
+# MiMo 9B / Qwen3.5 as Ollama reports it: 32 layers, of which only every fourth keeps a growing cache.
+MIMO_INFO = {"general.architecture": "qwen35", "qwen35.block_count": 32, "qwen35.attention.head_count": 16,
+             "qwen35.attention.head_count_kv": 4, "qwen35.attention.key_length": 256,
+             "qwen35.attention.value_length": 256, "qwen35.embedding_length": 4096,
+             "qwen35.full_attention_interval": 4, "qwen35.attention.recurrent_layers": [True, True, True, False] * 8}
+
+
+def test_hybrid_models_only_cache_their_attention_layers():
+    from locpilot.llm.ollama import kv_cache_bytes
+
+    assert kv_cache_bytes(MIMO_INFO, 16384, "f16") == 8 * 4 * (256 + 256) * 16384 * 2  # 0.5 GiB, not 2 GiB
+    by_interval = {k: v for k, v in MIMO_INFO.items() if not k.endswith("recurrent_layers")}
+    assert kv_cache_bytes(by_interval, 16384, "f16") == 8 * 4 * (256 + 256) * 16384 * 2
+    only_recurrent = {**MIMO_INFO, "qwen35.attention.recurrent_layers": [True] * 32}
+    assert kv_cache_bytes(only_recurrent, 16384, "f16") == 0
 
 
 async def test_free_ram_now_unloads_the_model_but_not_other_programs_models(settings, ollama):

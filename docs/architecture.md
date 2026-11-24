@@ -184,7 +184,8 @@ reconnects never lose history. Token progress and live command output are epheme
 
 Inside: `locpilot.db`, `checkpoints.db`, `repos/` (clones), `worktrees/<task>`,
 `archived-worktrees/<task>.json` (worktrees archived to free space; restored on next use),
-`index/symbols.sqlite` (the code index, a cache), `scratch/<task>` (sandbox temp/caches), `logs/`.
+`index/symbols.sqlite` (the code index, a cache), `model-sizes.json` (the RAM each model took when
+loaded, for the memory check), `scratch/<task>` (sandbox temp/caches), `logs/`.
 
 **Code index.** Symbols (definitions, call sites, imports) are kept in `index/symbols.sqlite`, not in
 memory, so a large repository costs disk rather than RAM (up to the inventory's 60,000 files). Each

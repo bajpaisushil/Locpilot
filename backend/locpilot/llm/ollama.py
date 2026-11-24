@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -18,6 +19,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
 import httpx
@@ -43,14 +45,41 @@ class LLMResponseError(RuntimeError):
 
 @dataclass
 class ModelUsage:
-    """Models this LocPilot run made Ollama load into memory, so it can free them again (shared by clients)."""
+    """Models this LocPilot run made Ollama load into memory, so it can free them again (shared by clients).
+
+    Also what each model really took in memory once loaded, kept in ``sizes_path`` across runs: the estimate from
+    file size + context can overshoot by gigabytes (MiMo's file includes vision weights a code task never loads).
+    """
 
     loaded: set[str] = field(default_factory=set)  # loaded because of LocPilot: LocPilot frees them
     checked: set[str] = field(default_factory=set)  # models whose prior state has been looked at
+    sizes_path: Path | None = None
+    sizes: dict[str, int] = field(default_factory=dict)  # "model|num_ctx|kv cache type" -> bytes
+
+    def __post_init__(self) -> None:
+        if self.sizes_path is not None:
+            try:
+                data = json.loads(self.sizes_path.read_text(encoding="utf-8"))
+                self.sizes = {str(k): int(v) for k, v in data.items() if isinstance(v, int) and v > 0}
+            except (OSError, ValueError, AttributeError):
+                self.sizes = {}
 
     def forget(self, model: str) -> None:
         self.loaded.discard(model)
         self.checked.discard(model)
+
+    def remember_size(self, key: str, size: int) -> None:
+        if self.sizes.get(key) == size:
+            return
+        self.sizes[key] = size
+        if self.sizes_path is not None:
+            try:
+                self.sizes_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.sizes_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self.sizes, indent=1, sort_keys=True), encoding="utf-8")
+                tmp.replace(self.sizes_path)
+            except OSError as exc:
+                log.info("could not save model sizes: %s", exc)
 
 
 @dataclass
@@ -192,6 +221,16 @@ def kv_cache_bytes(model_info: dict, num_ctx: int, kv_cache_type: str = "f16") -
         return float(value) if isinstance(value, int | float) and value > 0 else None
 
     layers, heads = num("block_count"), num("attention.head_count")
+    # Hybrid models (Qwen3.5/MiMo, Qwen3-Next, …) keep a growing cache only in their attention layers; the others
+    # are recurrent (linear attention) with a small fixed state. MiMo 9B: 8 of 32 layers, a quarter of the cache.
+    recurrent = model_info.get(f"{arch}.attention.recurrent_layers")
+    interval = num("full_attention_interval")
+    if layers and isinstance(recurrent, list) and recurrent and all(isinstance(r, bool) for r in recurrent):
+        layers = float(sum(1 for r in recurrent if not r))
+        if not layers:
+            return 0  # only recurrent layers: no cache that grows with the context
+    elif layers and interval:
+        layers = float(math.ceil(layers / interval))
     heads_kv = num("attention.head_count_kv") or heads
     width = num("embedding_length")
     key_len = num("attention.key_length") or (width / heads if width and heads else None)
@@ -356,9 +395,17 @@ class OllamaClient:
         shown = await self._show()
         if shown and isinstance(shown.get("model_info"), dict):
             info["context_bytes"] = kv_cache_bytes(shown["model_info"], self.num_ctx, info["kv_cache_type"])
+        key = f"{self.model}|{self.num_ctx}|{info['kv_cache_type']}"
         if mine is not None:
             info["loaded_bytes"] = mine["size_bytes"]
             info["needed_bytes"] = 0
+            if self.usage and mine["size_bytes"] and mine.get("context_length") in (None, self.num_ctx):
+                self.usage.remember_size(key, int(mine["size_bytes"]))
+            return info
+        if self.usage and key in self.usage.sizes:  # loaded before with these settings: it takes that again
+            info["needed_bytes"] = self.usage.sizes[key]
+            avail = info["available_bytes"]
+            info["short"] = avail is not None and info["needed_bytes"] > avail
             return info
         try:
             size = next((m["size_bytes"] for m in await self.list_models()

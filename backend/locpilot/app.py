@@ -46,7 +46,8 @@ def create_app(settings: Settings | None = None, *, llm_factory: Callable[[], LL
     settings.ensure_dirs()
     db = Database(settings.db_path)
     configure_store(settings.symbol_index_path)  # the on-disk symbol index; also tidies it up
-    usage = ModelUsage()  # models this run made Ollama load; freed again on quit
+    # Models this run made Ollama load (freed again on quit), and what models really take in memory.
+    usage = ModelUsage(sizes_path=settings.data_dir / "model-sizes.json")
     launcher_ref: list[OllamaLauncher] = []
 
     def kv_cache_type() -> str:
