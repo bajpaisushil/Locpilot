@@ -91,6 +91,9 @@ class LLMResult:
     model: str
     truncated: bool = False
     thinking: str = ""  # the model's reasoning before the answer (thinking models with think=True)
+    # Tools the model asked to call, as {"name": str, "arguments": dict}. Agent-tuned models answer this way by
+    # training — sometimes even when no tools were offered — so a reply without text is not necessarily empty.
+    tool_calls: list[dict] = field(default_factory=list)
 
 
 class LLMClient(Protocol):
@@ -98,7 +101,7 @@ class LLMClient(Protocol):
 
     async def chat(self, messages: list[dict], *, schema: dict | None = None, max_tokens: int = 1024,
                    on_progress: ProgressCallback | None = None, temperature: float | None = None,
-                   think: bool = False) -> LLMResult: ...
+                   think: bool = False, tools: list[dict] | None = None) -> LLMResult: ...
 
 
 def inline_refs(schema: dict) -> dict:
@@ -283,6 +286,28 @@ def reasoning_in_circles(text: str, window: int = 300) -> bool:
 # Model capabilities ("completion", "thinking", "tools", …) per (Ollama URL, model), read once per run.
 _show_cache: dict[tuple[str, str], dict] = {}  # /api/show per (Ollama URL, model)
 
+AUTO_CONTEXT = 32768
+AUTO_CONTEXT_MAX_BYTES = int(1.25 * 2**30)  # what 32k tokens of context may cost to count as cheap
+
+
+def context_for(base_url: str, model: str, configured: int, ram_bytes: int | None) -> int:
+    """The context window to use when the user has not chosen one.
+
+    Hybrid models (Qwen3.5/MiMo: only every fourth layer keeps a cache that grows with the context) hold 32k tokens
+    in about 1 GB, so on a machine with 16 GB or more they get a 32k window — room to read more code before
+    answering, and to keep one conversation going across steps. Every other model keeps ``configured``. Known only
+    once Ollama has described the model (/api/show, cached), which happens before the first chat.
+    """
+    shown = _show_cache.get((base_url.rstrip("/"), model))
+    info = shown.get("model_info") if isinstance(shown, dict) else None
+    if not isinstance(info, dict) or configured >= AUTO_CONTEXT or not ram_bytes or ram_bytes < 15 * 2**30:
+        return configured
+    trained = info.get(f"{info.get('general.architecture')}.context_length")
+    cost = kv_cache_bytes(info, AUTO_CONTEXT, "f16")
+    if cost is None or cost > AUTO_CONTEXT_MAX_BYTES or (isinstance(trained, int) and trained < AUTO_CONTEXT):
+        return configured
+    return AUTO_CONTEXT
+
 
 def setup_hint(base_url: str, model: str) -> str:
     return (f"Start Ollama (open the Ollama app or run `ollama serve`) so it listens on {base_url}, "
@@ -293,7 +318,7 @@ class OllamaClient:
     def __init__(self, base_url: str, model: str, *, num_ctx: int = 16384, temperature: float = 0.1,
                  timeout_s: float = 900.0, seed: int | None = 7, allow_remote: bool = False,
                  keep_alive: str = "30m", usage: ModelUsage | None = None, thinking_tokens: int = 4096,
-                 kv_cache_type: str = "") -> None:
+                 kv_cache_type: str = "", num_ctx_auto: bool = False) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.num_ctx = num_ctx
@@ -307,6 +332,7 @@ class OllamaClient:
         # How Ollama stores the context: set when LocPilot started Ollama with memory_saving_env(), else unknown
         # ("": estimates assume Ollama's 16-bit default, so they err on the safe side).
         self.kv_cache_type = kv_cache_type
+        self.num_ctx_auto = num_ctx_auto  # LocPilot chose the context size (see context_for), not the user
 
     def _check_local(self) -> None:
         if not self.allow_remote and not ollama_url_is_local(self.base_url):
@@ -458,7 +484,8 @@ class OllamaClient:
     async def status(self) -> dict:
         info: dict[str, Any] = {"ollama_reachable": False, "ollama_version": None, "ollama_url": self.base_url,
                                 "configured_model": self.model, "model_available": False, "models": [],
-                                "num_ctx": self.num_ctx, "temperature": self.temperature, "error": None, "hint": None,
+                                "num_ctx": self.num_ctx, "num_ctx_auto": self.num_ctx_auto,
+                                "temperature": self.temperature, "error": None, "hint": None,
                                 "memory": None}
         try:
             info["ollama_version"] = await self.version()
@@ -498,36 +525,58 @@ class OllamaClient:
         if not already:  # a model another program loaded is left to that program
             usage.loaded.add(self.model)
 
+    async def supports_tools(self) -> bool:
+        """Whether the model can call tools (Ollama's "tools" capability)."""
+        caps = await self.capabilities()
+        return bool(caps and "tools" in caps)
+
     async def chat(self, messages: list[dict], *, schema: dict | None = None, max_tokens: int = 1024,
                    on_progress: ProgressCallback | None = None, temperature: float | None = None,
-                   think: bool = False) -> LLMResult:
+                   think: bool = False, tools: list[dict] | None = None) -> LLMResult:
         """One model call. ``think`` lets a thinking model reason first; for other models it is ignored.
+
+        ``tools`` (function specs) are offered only to models that can call them; the calls come back in
+        ``LLMResult.tool_calls``.
 
         Thinking models think by default, so they get an explicit ``think`` either way. The reasoning gets its own
         ``thinking_tokens`` budget on top of the answer's. If the model spends all of it, or goes in circles,
         without answering, the reasoning is cut off and the call is repeated once without thinking.
+
+        The other way round too: told not to think, some thinking models (MiMo) still reason briefly, Ollama drops
+        that, and the model stops without writing an answer — an empty reply that would fail the step. Then the call
+        is repeated once with thinking allowed (same budget and loop protection).
         """
         self._check_local()
         await self._note_usage()
         caps = await self.capabilities()
+        offered = tools if tools and caps is not None and "tools" in caps else None
         if caps is None or "thinking" not in caps:
-            return await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=None)
+            return await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=None,
+                                         tools=offered)
         if not think:
-            return await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=False)
+            result = await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=False,
+                                           tools=offered)
+            if result.content.strip() or result.tool_calls:
+                return result
+            log.info("%s gave an empty answer without thinking (%s tokens); asking again with thinking", self.model,
+                     result.completion_tokens)
+            retry = await self._chat_once(messages, schema, max_tokens + self.thinking_tokens, on_progress,
+                                          temperature, think=True, thinking_budget=self.thinking_tokens,
+                                          tools=offered)
+            return _merged(result, retry, thinking=retry.thinking)
         result = await self._chat_once(messages, schema, max_tokens + self.thinking_tokens, on_progress, temperature,
-                                       think=True, thinking_budget=self.thinking_tokens)
-        if result.content.strip() or not result.truncated:
+                                       think=True, thinking_budget=self.thinking_tokens, tools=offered)
+        if result.content.strip() or result.tool_calls or not result.truncated:
             return result
         log.info("%s gave no answer after reasoning; asking again without thinking", self.model)
-        retry = await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=False)
-        return LLMResult(content=retry.content, prompt_tokens=result.prompt_tokens + retry.prompt_tokens,
-                         completion_tokens=result.completion_tokens + retry.completion_tokens,
-                         duration_ms=result.duration_ms + retry.duration_ms, model=self.model,
-                         truncated=retry.truncated, thinking=result.thinking)
+        retry = await self._chat_once(messages, schema, max_tokens, on_progress, temperature, think=False,
+                                      tools=offered)
+        return _merged(result, retry, thinking=result.thinking)
 
     async def _chat_once(self, messages: list[dict], schema: dict | None, max_tokens: int,
                          on_progress: ProgressCallback | None, temperature: float | None, *,
-                         think: bool | None, thinking_budget: int | None = None) -> LLMResult:
+                         think: bool | None, thinking_budget: int | None = None,
+                         tools: list[dict] | None = None) -> LLMResult:
         options: dict[str, Any] = {"num_ctx": self.num_ctx, "num_predict": max_tokens, "top_p": 0.9,
                                    "temperature": self.temperature if temperature is None else temperature}
         if self.seed is not None:
@@ -538,10 +587,13 @@ class OllamaClient:
             payload["format"] = schema
         if think is not None:
             payload["think"] = think
+        if tools:
+            payload["tools"] = tools
         timeout = httpx.Timeout(connect=5.0, read=self.timeout_s, write=60.0, pool=5.0)
         start = time.monotonic()
         parts: list[str] = []
         thoughts: list[str] = []
+        tool_calls: list[dict] = []
         chunks = thought_chunks = 0  # streamed pieces (about one token each)
         prompt_tokens = completion_tokens = 0
         done_reason = None
@@ -567,6 +619,10 @@ class OllamaClient:
                             parts.append(piece)
                         if thought:
                             thoughts.append(thought)
+                        for call in message.get("tool_calls") or []:
+                            parsed = _tool_call(call)
+                            if parsed is not None:
+                                tool_calls.append(parsed)
                         if piece or thought:  # reasoning is progress too: the UI shows the model is working
                             chunks += 1
                             if on_progress is not None and chunks % 16 == 0:
@@ -593,7 +649,8 @@ class OllamaClient:
             completion_tokens = chunks
         return LLMResult(content="".join(parts), prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                          duration_ms=int((time.monotonic() - start) * 1000), model=self.model,
-                         truncated=bool(cut_off) or done_reason == "length", thinking="".join(thoughts))
+                         truncated=bool(cut_off) or done_reason == "length", thinking="".join(thoughts),
+                         tool_calls=tool_calls)
 
     async def pull(self, model: str, on_update: Callable[[dict], Awaitable[None]]) -> None:
         """Ask the local Ollama daemon to download a model (explicit user action from the setup screen)."""
@@ -621,17 +678,51 @@ class OllamaClient:
                     await on_update({"status_text": data.get("status", ""), "completed": completed, "total": total})
 
 
+def _merged(first: LLMResult, second: LLMResult, *, thinking: str) -> LLMResult:
+    """The second attempt's answer, with both attempts' tokens and time counted."""
+    return LLMResult(content=second.content, prompt_tokens=first.prompt_tokens + second.prompt_tokens,
+                     completion_tokens=first.completion_tokens + second.completion_tokens,
+                     duration_ms=first.duration_ms + second.duration_ms, model=second.model,
+                     truncated=second.truncated, thinking=thinking, tool_calls=second.tool_calls)
+
+
+def _tool_call(raw: Any) -> dict | None:
+    """One tool call from Ollama's stream as {"name", "arguments"} (arguments may arrive as a JSON string)."""
+    fn = raw.get("function") if isinstance(raw, dict) else None
+    if not isinstance(fn, dict) or not fn.get("name"):
+        return None
+    args = fn.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            args = {"_raw": args}
+    return {"name": str(fn["name"]), "arguments": args if isinstance(args, dict) else {}}
+
+
+# A structured answer cut off at its token limit is retried with twice the budget, up to this many tokens.
+MAX_RETRY_TOKENS = 4096
+
+
 async def chat_json(client: LLMClient, messages: list[dict], model_cls: type[T], *, max_tokens: int,
                     on_progress: ProgressCallback | None = None, retries: int = 1,
-                    think: bool = False) -> tuple[T, list[LLMResult]]:
-    """Structured output with schema-constrained decoding, validation and one repair retry."""
+                    think: bool = False, tools: list[dict] | None = None) -> tuple[T, list[LLMResult]]:
+    """Structured output with schema-constrained decoding, validation and one repair retry.
+
+    An answer cut off at the token limit is retried with twice the budget (up to MAX_RETRY_TOKENS): a verbose model
+    asked to be concise within the same limit often runs out again.
+    """
     schema = inline_refs(model_cls.model_json_schema())
     results: list[LLMResult] = []
     convo = list(messages)
     last_error = ""
+    budget = max_tokens
     for _attempt in range(retries + 1):
-        result = await client.chat(convo, schema=schema, max_tokens=max_tokens, on_progress=on_progress,
-                                   think=think)
+        # ``tools`` are only declared to keep the prompt identical to the conversation this call continues (the
+        # model server reuses its work only for an identical beginning); the schema still forces a JSON answer.
+        extra = {"tools": tools} if tools else {}
+        result = await client.chat(convo, schema=schema, max_tokens=budget, on_progress=on_progress,
+                                   think=think, **extra)
         results.append(result)
         try:
             data = extract_json(result.content)
@@ -640,6 +731,7 @@ async def chat_json(client: LLMClient, messages: list[dict], model_cls: type[T],
             last_error = str(exc)[:600]
             if result.truncated:
                 last_error = "output was cut off at the token limit; be more concise. " + last_error
+                budget = max(budget, min(budget * 2, MAX_RETRY_TOKENS))
             convo = list(messages) + [
                 {"role": "assistant", "content": result.content[:4000]},
                 {"role": "user", "content": f"That response was not valid JSON for the schema ({last_error}). "

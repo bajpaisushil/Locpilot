@@ -18,7 +18,7 @@ from locpilot.agent.runner import TaskManager
 from locpilot.api import repos, setup, storage, tasks, terminals
 from locpilot.config import Settings, get_settings
 from locpilot.llm.launcher import OllamaLauncher, memory_saving_env
-from locpilot.llm.ollama import LLMClient, ModelUsage, OllamaClient
+from locpilot.llm.ollama import LLMClient, ModelUsage, OllamaClient, context_for, physical_memory
 from locpilot.security.http import LocalSecurityMiddleware
 from locpilot.storage.db import Database
 from locpilot.tools.symbols import configure_store
@@ -29,9 +29,13 @@ def default_llm_factory(settings: Settings, db: Database, usage: ModelUsage | No
                         kv_cache_type: Callable[[], str] | None = None) -> Callable[[], OllamaClient]:
     def factory() -> OllamaClient:
         model = db.get_setting("model") or settings.model
-        num_ctx = db.get_setting("num_ctx") or settings.num_ctx
+        num_ctx = db.get_setting("num_ctx")
+        chosen = num_ctx is not None or "num_ctx" in settings.model_fields_set  # in Settings, or LOCPILOT_NUM_CTX
+        if not chosen:  # a larger window where the model makes it cheap
+            num_ctx = context_for(settings.ollama_url, model, settings.num_ctx, physical_memory())
         temperature = db.get_setting("temperature")
-        return OllamaClient(settings.ollama_url, model, num_ctx=int(num_ctx),
+        return OllamaClient(settings.ollama_url, model, num_ctx=int(num_ctx or settings.num_ctx),
+                            num_ctx_auto=not chosen and int(num_ctx) != settings.num_ctx,
                             temperature=settings.temperature if temperature is None else float(temperature),
                             timeout_s=settings.llm_timeout_s, seed=settings.llm_seed,
                             allow_remote=settings.allow_remote_ollama, keep_alive=settings.ollama_keep_alive,

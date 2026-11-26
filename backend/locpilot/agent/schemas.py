@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Intent = Literal["explain", "root_cause", "fix", "add_tests", "review_changes", "explain_changes", "retry_fix",
                  "question"]
@@ -103,6 +103,35 @@ class LLMPlan(BaseModel):
     risks: list[str] = Field(default_factory=list, max_length=4)
 
 
+class LLMEdit(BaseModel):
+    path: str = Field(description="the file to edit, exactly as shown")
+    search: str = Field(default="", description="exact existing lines to replace, copied from the file with their "
+                                                 "indentation; empty to create the file or append to it")
+    replace: str = Field(description="the lines that replace them (for a new file: its whole content)")
+
+
+class LLMEditList(BaseModel):
+    """The same edits as SEARCH/REPLACE blocks, as JSON: asked for when a reply contained no blocks at all."""
+
+    edits: list[LLMEdit] = Field(min_length=1, max_length=12)
+
+
+class LLMRequirementCheck(BaseModel):
+    requirement: str
+    why: str = Field(description="the concrete input tried, what the changed code returns for it, what the request "
+                                 "demands")
+    holds: bool
+
+
+class LLMPatchCheck(BaseModel):
+    """A second look at a proposed change: does it do what the request asks?"""
+
+    # At least one, each worked through before the verdict: an empty list is how a model skips the check.
+    requirements: list[LLMRequirementCheck] = Field(min_length=1, max_length=8)
+    verdict: Literal["ok", "code_wrong", "test_wrong", "both_wrong"]
+    correction: str = ""
+
+
 class LLMTestSpec(BaseModel):
     scenario: str = Field(description="The situation from the bug report the test recreates")
     inputs: str = Field(description="Concrete input values the test will use")
@@ -116,6 +145,35 @@ class LLMFailureAnalysis(BaseModel):
     cause: Literal["fix_incorrect", "test_incorrect", "environment", "preexisting_failure", "unknown"]
     should_retry: bool
     next_step: str = ""
+
+
+def _trace_first(schema: dict) -> None:
+    """The model must write the trace (and before the verdict); scripted answers without one still validate."""
+    schema["required"] = ["trace", *[name for name in schema.get("required", []) if name != "trace"]]
+
+
+class LLMTracedFailure(BaseModel):
+    """A failure diagnosis that works through the failing assertion with real values before it judges."""
+
+    model_config = ConfigDict(json_schema_extra=_trace_first)
+
+    trace: str = Field(default="", description="Step by step, with the actual values: how the code as it is now "
+                                               "turns the failing test's input into the value it received")
+    diagnosis: str
+    cause: Literal["fix_incorrect", "test_incorrect", "environment", "preexisting_failure", "unknown"]
+    should_retry: bool
+    next_step: str = ""
+
+
+class LLMWalkThrough(BaseModel):
+    """The model's own check of a finished change: the request's example computed through the changed code."""
+
+    example: str = Field(description="The input taken from the request (or the simplest one that shows the problem)")
+    trace: str = Field(description="The changed code followed line by line for that input, with the actual values")
+    result: str = Field(description="What the changed code returns for the example")
+    expected: str = Field(description="What the request asks for")
+    correct: bool = Field(description="true only if result and expected agree")
+    problem: str = Field(default="", description="If not correct: the line where the values go wrong, and why")
 
 
 class LLMFileNote(BaseModel):

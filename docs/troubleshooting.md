@@ -50,12 +50,18 @@ cannot think ignore the setting. With `LOCPILOT_DEBUG_LLM=true`, the reasoning i
 
 ## Not enough RAM / very slow answers
 
-* The default `mimo-v2.6:9b-q4_K_M` uses about 5.8 GB of RAM with a 16k context (measured with
-  `ollama ps` on an Apple M4); leave a couple of GB more free. Close heavy apps (Docker,
-  browsers) or lower the context: Settings → context size, or `LOCPILOT_NUM_CTX=8192`.
-* Settings shows how much RAM the model uses (or would need) next to what is free, and a task logs a
-  warning when loading the model would not fit — that is when your computer would start swapping.
-  **Free RAM now** in Settings unloads the model at once; the next message loads it again.
+* The default `mimo-v2.6:9b-q4_K_M` uses about 5.5–6 GB of RAM (measured with `ollama ps` on an
+  Apple M4); leave a couple of GB more free. On machines with 16 GB or more LocPilot gives it a
+  32k context window by itself, because this model holds context cheaply (about 0.5 GB more than
+  16k). Close heavy apps (Docker, browsers) or lower the context: Settings → context size, or
+  `LOCPILOT_NUM_CTX=8192`.
+* The **memory meter** in the top bar shows how much RAM the model uses (or would need) next to what
+  is free; a task logs a warning when loading the model would not fit — that is when your computer
+  would start swapping. **Free RAM now** (in the meter's menu and in Settings) unloads the model at
+  once; the next message loads it again.
+* For the open task, the meter's menu also shows how full the model's context window was at the last
+  step. Long conversations carry earlier findings along; **Clear context** makes the next message
+  start fresh (the worktree and LocPilot's changes are kept), which leaves the whole window for it.
 * When LocPilot starts Ollama itself it stores the context in 8 bits (`OLLAMA_KV_CACHE_TYPE=q8_0` with
   flash attention): about half the context memory, no measurable quality loss. Your own `OLLAMA_*`
   variables win; `LOCPILOT_OLLAMA_KV_CACHE_TYPE=""` turns it off. An Ollama you run yourself (or the

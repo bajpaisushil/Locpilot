@@ -188,6 +188,7 @@ export const api = {
   sendMessage: (id: string, message: string, mode?: Mode) =>
     request<TaskDetail>('POST', `/api/tasks/${enc(id)}/messages`, mode ? { message, mode } : { message }),
   cancelTask: (id: string) => request<TaskDetail>('POST', `/api/tasks/${enc(id)}/cancel`, {}),
+  clearTaskContext: (id: string) => request<TaskDetail>('POST', `/api/tasks/${enc(id)}/context/clear`, {}),
   resumeTask: (id: string) => request<TaskDetail>('POST', `/api/tasks/${enc(id)}/resume`, {}),
   decideApproval: (taskId: string, approvalId: string, decision: ApprovalDecision) =>
     request<TaskDetail>('POST', `/api/tasks/${enc(taskId)}/approvals/${enc(approvalId)}`, decision),

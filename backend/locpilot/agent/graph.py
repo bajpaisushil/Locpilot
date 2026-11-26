@@ -25,6 +25,7 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
@@ -40,11 +41,26 @@ from locpilot.agent.schemas import (
     InvestigationReport,
     LLMAnalysis,
     LLMChangeReview,
+    LLMEditList,
     LLMExplanation,
     LLMFailureAnalysis,
+    LLMPatchCheck,
     LLMPlan,
     LLMTestSpec,
+    LLMTracedFailure,
+    LLMWalkThrough,
     TaskUnderstanding,
+)
+from locpilot.agent.toolcalls import (
+    EDIT_TOOLS,
+    EXPLORE_TOOLS,
+    PATH_ARGS,
+    EditSession,
+    ExploreSession,
+    arg,
+    assistant_message,
+    kind_of,
+    tool_message,
 )
 from locpilot.agent.workspace import USER_STAGE, WorkspaceError, prepare_worktree, run_verification_command
 from locpilot.config import Settings
@@ -55,9 +71,10 @@ from locpilot.security.sandbox import detect_sandbox
 from locpilot.security.secrets import redact
 from locpilot.storage.db import Database, now_iso
 from locpilot.tools import git
-from locpilot.tools.files import RepoIndex, get_index, is_test_path, language_for
+from locpilot.tools.files import RepoIndex, get_index, is_excluded, is_test_path, language_for
 from locpilot.tools.manifests import inspect_project
 from locpilot.tools.patch import (
+    EditBlock,
     FileChange,
     UnexpectedChangeError,
     apply_changes,
@@ -68,17 +85,33 @@ from locpilot.tools.patch import (
 )
 from locpilot.tools.symbols import get_symbol_index
 
+# Model turns one tool loop may take (each is short: a tool call, or a few of them).
+MAX_EDIT_TURNS = 10
+EDIT_TURN_TOKENS = 3200  # one reply of the edit loop: room for a new file of about 250 lines
+MAX_EXPLORE_TURNS = 10
+EXPLORE_SNIPPET_LINES = 45  # lines of each snippet found beforehand that the exploring prompt shows
+# Every tool call gets a reply (a model left without one waits for it); calls past the per-step limit get this.
+SKIPPED_CALL = "Not run: too many calls in one step. Ask again if you still need it."
+# Share of the evidence budget the keyword search may fill when the model can explore by itself afterwards, and
+# how far its own lookups may go past the budget (what it chose to read matters most).
+SEED_SHARE = 0.65
+EXPLORE_SHARE = 1.2
+CHARS_PER_TOKEN = 3.2  # code with line numbers, estimated low so prompts are not cut by the context window
+
 # Steps where a thinking model reasons before answering when Settings.thinking is "auto": finding the root cause
 # and explaining a failed verification. The other steps format, classify or copy and gain little from it.
 THINKING_STEPS = frozenset({"analyze", "diagnose"})
 
 
-def new_test_file(path: str) -> str:
+def new_test_file(path: str, tools: bool = False) -> str:
     """The regression test file doesn't exist yet: how to create it, with the exact block to write.
 
     Without this, models dropped the imports or swapped the SEARCH and REPLACE halves. Only this step shows the
     template: in the edit rules every step shares, it changed how a 7B model wrote ordinary fixes.
     """
+    if tools:
+        return (f"### {path}\n(new file) Create it with the write tool: the complete file, starting with the "
+                "imports of the test framework and of the code under test.")
     return (f"### {path}\n(new file) Create it with one block: an empty SEARCH section, then the complete file after "
             "the ======= line, starting with the imports of the test framework and of the code under test:\n"
             f"{path}\n<<<<<<< SEARCH\n=======\n<the complete test file>\n>>>>>>> REPLACE")
@@ -88,6 +121,11 @@ def new_test_file(path: str) -> str:
 PERSISTENT_KEYS = ("task_id", "repo_id", "repo_path", "worktree_path", "base_commit", "history", "report",
                    "plan", "evidence", "notes", "overview", "approved_commands", "last_runs", "applied_patch_ids",
                    "proposed_commands")
+
+
+# What earlier turns found, said and planned: the part of the carried-over state "Clear context" drops, so the next
+# message starts fresh. The worktree, the changes LocPilot applied and the commands you approved stay.
+CONTEXT_KEYS = ("history", "report", "plan", "evidence", "notes", "last_runs", "proposed_commands")
 
 
 class AgentState(TypedDict, total=False):
@@ -110,6 +148,18 @@ class AgentState(TypedDict, total=False):
     tool_log: list[dict]
     evidence_rounds: int
     evidence_done: bool
+    # One conversation across steps (tool-capable models): the analysis continues the exploration and the plan
+    # continues the analysis, so the model server does not process the same context again for every step.
+    explore_messages: list[dict]
+    analysis_messages: list[dict]
+    conversation_tokens: int  # tokens in that conversation so far (to know whether a follow-up still fits)
+    conversation_tools: bool  # that conversation was offered the explore tools (later calls must repeat them)
+    # The conversation in which the model last wrote tests or code, and the diagnosis that continued it: a failed
+    # verification is diagnosed and repaired where the model can see its own work and the code it read.
+    work_messages: list[dict]
+    work_tokens: int
+    diagnose_messages: list[dict]
+    diagnose_tokens: int
     raw_analysis: dict | None
     report: dict | None
     report_turn: int
@@ -136,6 +186,7 @@ class AgentState(TypedDict, total=False):
     diagnosis: dict | None
     retry_planned: bool
     repair_target: str
+    repair_tests: list[str]  # existing test files a test repair may update (their assertions are outdated)
     test_repair_needed: bool
     before_checked_for: str | None
     review: dict | None
@@ -212,11 +263,14 @@ def turn_input(carry: dict, *, task_id: str, repo: dict, turn: int, mode: str, r
     state.update({
         "task_id": task_id, "repo_id": repo["id"], "repo_path": repo["path"], "turn": turn, "mode": mode,
         "request": request, "understanding": None, "intent": "", "tool_log": [], "evidence_rounds": 0,
-        "evidence_done": False, "raw_analysis": None, "patch_id": None, "patch_mode": "initial",
+        "evidence_done": False, "explore_messages": [], "analysis_messages": [], "conversation_tokens": 0,
+        "conversation_tools": False, "work_messages": [], "work_tokens": 0, "diagnose_messages": [],
+        "diagnose_tokens": 0,
+        "raw_analysis": None, "patch_id": None, "patch_mode": "initial",
         "patch_attempts": 0, "patch_error": None, "approval_decision": None, "feedback": None, "apply_stage": "",
         "verify_stage": "", "before_runs": [], "runs": [], "verification": None, "failure_signatures": [],
         "stalled": False, "repair_attempts": 0, "diagnosis": None, "retry_planned": False,
-        "repair_target": "code", "test_repair_needed": False, "before_checked_for": None, "review": None, "clarifying_question": None,
+        "repair_target": "code", "repair_tests": [], "test_repair_needed": False, "before_checked_for": None, "review": None, "clarifying_question": None,
         "unresolved": [], "warnings": [], "llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
         "tool_calls": 0, "turn_started": time.time(), "final_status": "", "task_status": "running",
         "user_runs": [run_entry(r) for r in user_runs or []],
@@ -237,6 +291,30 @@ _NO_FIX = re.compile(r"\b(do not|don't|dont|without|no need to|not)\s+(\w+\s+){0
 
 def _asks_for_fix(request: str) -> bool:
     return bool(_FIX_VERB.search(request)) and not _NO_FIX.search(request)
+
+
+def test_files_in(test_ids: list[str], files: list[str]) -> list[str]:
+    """The test files that failing test ids name (as a path, or dotted like a Python module)."""
+    found = []
+    for path in files:
+        if is_test_path(path) and any(path in t or path.rsplit(".", 1)[0].replace("/", ".") in t for t in test_ids):
+            found.append(path)
+    return found
+
+
+def new_source_path(index: RepoIndex, raw: str) -> str | None:
+    """A file the plan wants to create: accepted when it would sit next to source files of the same kind."""
+    try:
+        path = normalize_relpath((raw or "").strip().strip("`'\"").removeprefix("./"))
+    except PathSecurityError:
+        return None
+    if "/" not in path or "." not in path.rsplit("/", 1)[-1] or index.has_file(path) or is_test_path(path):
+        return None
+    if is_excluded(path) or language_for(path) is None:
+        return None
+    folder, suffix = path.rsplit("/", 1)[0] + "/", "." + path.rsplit(".", 1)[-1]
+    siblings = [f for f in index.files if f.startswith(folder) and "/" not in f[len(folder):]]
+    return path if any(f.endswith(suffix) and not is_test_path(f) for f in siblings) else None
 
 
 def _remap_path(path: str, allowed: set[str]) -> str | None:
@@ -343,13 +421,15 @@ class LocPilotGraph:
         return get_index(Path(state["workspace_path"]))
 
     def _debug(self, state: AgentState, step: str, messages: list[dict], outputs: list[str],
-               thinking: list[str] | None = None) -> None:
+               thinking: list[str] | None = None, tool_calls: list[dict] | None = None) -> None:
         if not self.settings.debug_llm:
             return
         record = {"ts": now_iso(), "task": state["task_id"], "turn": state["turn"], "step": step,
                   "prompt": messages[-1]["content"], "outputs": outputs}
         if thinking and any(thinking):
             record["thinking"] = thinking
+        if tool_calls:
+            record["tool_calls"] = tool_calls
         with open(self.settings.logs_dir / "llm-debug.jsonl", "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
 
@@ -362,12 +442,28 @@ class LocPilotGraph:
                 "prompt_tokens": state.get("prompt_tokens", 0) + sum(r.prompt_tokens for r in results),
                 "completion_tokens": state.get("completion_tokens", 0) + sum(r.completion_tokens for r in results)}
 
+    def _note_context(self, state: AgentState, client: LLMClient, prompt_tokens: int) -> None:
+        """Remember how much of the context window the last model call filled (shown next to the memory meter)."""
+        if not prompt_tokens:
+            return
+        task = self.db.get_task(state["task_id"])
+        if task is None:
+            return
+        stats = task["stats"] or {}
+        stats["context_tokens"] = int(prompt_tokens)
+        stats["context_window"] = int(getattr(client, "num_ctx", None) or self.settings.num_ctx)
+        self.db.update_task(state["task_id"], stats=stats)
+
     def _think(self, step: str) -> bool:
         """Whether a thinking model reasons before answering in this step (see Settings.thinking)."""
         mode = self.settings.thinking
         return mode == "on" or (mode == "auto" and step in THINKING_STEPS)
 
-    async def llm_json(self, state: AgentState, step: str, user: str, model_cls, max_tokens: int):
+    async def llm_json(self, state: AgentState, step: str, user: str, model_cls, max_tokens: int,
+                       messages: list[dict] | None = None, keep: list | None = None,
+                       tools: list[dict] | None = None):
+        """One structured answer. ``messages`` continues a conversation instead of starting with ``user`` (then
+        ``tools`` must be the tools that conversation was offered); ``keep`` receives the raw model results."""
         self._budget(state)
         client: LLMClient = self.deps.llm()
         await self.emit(state, "llm", {"step": step, "state": "started", "model": client.model})
@@ -375,15 +471,18 @@ class LocPilotGraph:
         async def progress(tokens: int) -> None:
             await self.emit(state, "llm_progress", {"step": step, "tokens": tokens}, persist=False)
 
-        messages = [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": user}]
+        messages = messages or [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": user}]
         try:
             obj, results = await chat_json(client, messages, model_cls, max_tokens=max_tokens, on_progress=progress,
-                                           think=self._think(step))
+                                           think=self._think(step), tools=tools)
         except LLMResponseError as exc:
             self._debug(state, step, messages, [f"ERROR: {exc}"])
             await self.emit(state, "llm", {"step": step, "state": "failed", "model": client.model})
             raise
         self._debug(state, step, messages, [r.content for r in results], [r.thinking for r in results])
+        self._note_context(state, client, max((r.prompt_tokens for r in results), default=0))
+        if keep is not None:
+            keep.extend(results)
         await self.emit(state, "llm", {
             "step": step, "state": "completed", "model": client.model,
             "prompt_tokens": sum(r.prompt_tokens for r in results),
@@ -391,7 +490,13 @@ class LocPilotGraph:
             "duration_ms": sum(r.duration_ms for r in results)})
         return obj, self._usage(state, results)
 
-    async def llm_text(self, state: AgentState, step: str, messages: list[dict], max_tokens: int):
+    async def _tools_ok(self) -> bool:
+        """Whether the model is offered real tools (it can call them, and the setting allows it)."""
+        check = getattr(self.deps.llm(), "supports_tools", None)
+        return bool(self.settings.native_tools and check is not None and await check())
+
+    async def llm_text(self, state: AgentState, step: str, messages: list[dict], max_tokens: int,
+                       tools: list[dict] | None = None):
         self._budget(state)
         client: LLMClient = self.deps.llm()
         await self.emit(state, "llm", {"step": step, "state": "started", "model": client.model})
@@ -399,13 +504,37 @@ class LocPilotGraph:
         async def progress(tokens: int) -> None:
             await self.emit(state, "llm_progress", {"step": step, "tokens": tokens}, persist=False)
 
-        result = await client.chat(messages, max_tokens=max_tokens, on_progress=progress, think=self._think(step))
-        self._debug(state, step, messages, [result.content], [result.thinking])
+        extra = {"tools": tools} if tools else {}
+        result = await client.chat(messages, max_tokens=max_tokens, on_progress=progress, think=self._think(step),
+                                   **extra)
+        self._debug(state, step, messages, [result.content], [result.thinking], result.tool_calls)
+        self._note_context(state, client, result.prompt_tokens)
         await self.emit(state, "llm", {"step": step, "state": "completed", "model": client.model,
                                        "prompt_tokens": result.prompt_tokens,
                                        "completion_tokens": result.completion_tokens,
                                        "duration_ms": result.duration_ms})
         return result
+
+    def _window(self) -> int:
+        """The model's context window in tokens."""
+        return int(getattr(self.deps.llm(), "num_ctx", None) or self.settings.num_ctx)
+
+    def _follow_up(self, convo: list[dict], tokens: int, job: str, reserve: int) -> list[dict] | None:
+        """``convo`` continued with ``job`` — if that and ``reserve`` answer tokens still fit the context window."""
+        if not convo or tokens + len(job) / CHARS_PER_TOKEN + reserve + 300 > self._window():
+            return None
+        return [*convo, {"role": "user", "content": job}]
+
+    def _fit(self, build: Callable[[int | None], str], reserve: int) -> str:
+        """The prompt with as much of each evidence item as fits the context window next to ``reserve`` answer
+        tokens (a prompt that does not fit is cut by the model server, silently and from the top)."""
+        window = self._window()
+        text = build(None)
+        for lines in (90, 70, 50, 35):
+            if len(text) / CHARS_PER_TOKEN + reserve + 400 <= window:
+                break
+            text = build(lines)
+        return text
 
     def _context(self, state: AgentState, *, evidence_lines: int | None = None, with_evidence: bool = True,
                  with_user_runs: bool = True) -> str:
@@ -546,11 +675,12 @@ class LocPilotGraph:
     async def seed_evidence(self, state: AgentState) -> dict:
         await self.phase(state, "evidence", "Gathering evidence")
         u = TaskUnderstanding.model_validate(state["understanding"]) if state.get("understanding") else None
+        share = SEED_SHARE if await self._tools_ok() else 1.0
 
         def work():
             index = self.index(state)
             collector = EvidenceCollector(index, get_symbol_index(index), state.get("evidence") or [],
-                                          max_chars=self.settings.max_evidence_chars)
+                                          max_chars=int(self.settings.max_evidence_chars * share))
             log = collector.seed(state["request"], u, state["intent"])
             return collector, log
 
@@ -576,7 +706,89 @@ class LocPilotGraph:
             return "plan_evidence"
         return "analyze"
 
+    async def _explore(self, state: AgentState) -> dict:
+        """Evidence gathering as a tool loop: the model reads and searches, seeing each result before the next.
+
+        Whatever it looks at becomes evidence (with ids the analysis can cite); its closing summary is kept as a
+        note for the analysis.
+        """
+        label = "Exploring the code"
+        await self.phase(state, "evidence", label)
+        u = state.get("understanding") or {}
+        user = self._context(state, evidence_lines=EXPLORE_SNIPPET_LINES) + "\n\n" + prompts.EXPLORE.format(
+            request=state["request"], summary=u.get("summary", ""))
+        messages = [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": user}]
+        understanding = TaskUnderstanding.model_validate(state["understanding"]) if state.get("understanding") else None
+        terms = extract_terms(state["request"], understanding)
+
+        def open_session() -> ExploreSession:
+            index = self.index(state)
+            # What the model chooses to read may go past the keyword search's budget, further in a larger window.
+            budget = max(self.settings.max_evidence_chars * EXPLORE_SHARE, window * 0.5 * CHARS_PER_TOKEN)
+            collector = EvidenceCollector(index, get_symbol_index(index), state.get("evidence") or [],
+                                          max_chars=int(budget))
+            return ExploreSession(collector, Path(state["workspace_path"]), shown_lines=EXPLORE_SNIPPET_LINES)
+
+        window = self._window()
+        session = await asyncio.to_thread(open_session)
+        collector = session.collector
+        before = {e["id"] for e in state.get("evidence") or []}
+        limit = min(int(0.8 * window), window - 3800)  # the analysis continues this conversation: leave it room
+        used = 0
+        results = []
+        tool_log = list(state.get("tool_log") or [])
+        lookups, conclusion = 0, ""
+        local = dict(state)
+        for _turn in range(MAX_EXPLORE_TURNS):
+            if local.get("llm_calls", 0) + 3 > self.settings.max_llm_calls:
+                break
+            result = await self.llm_text(local, "explore", messages, max_tokens=700, tools=EXPLORE_TOOLS)
+            results.append(result)
+            local["llm_calls"] = local.get("llm_calls", 0) + 1
+            used = result.prompt_tokens + result.completion_tokens
+            if not result.tool_calls:
+                conclusion = result.content.strip()
+                messages = messages + [{"role": "assistant", "content": result.content}]
+                break
+            replies = []
+            for call in result.tool_calls[:4]:
+                reply, asked, new_ids = await asyncio.to_thread(session.handle, call)
+                fresh = [i for i in collector.items if i["id"] in new_ids]
+                followed = await asyncio.to_thread(collector.add_callees, fresh, terms) if fresh else []
+                if followed:  # what the code just read calls, in other files
+                    reply += "\n\nAlso shown, because that code calls them:\n" + render_evidence(followed)
+                    new_ids = new_ids + [i["id"] for i in followed]
+                    session.shown.update(i["id"] for i in followed)
+                replies.append(tool_message(call, reply))
+                lookups += 1
+                await self.emit(state, "tool_call", {
+                    "tool": asked["tool"], "args": {k: v for k, v in asked.items() if k != "tool" and v},
+                    "summary": f"{len(new_ids)} new snippets" if new_ids else reply.split("\n", 1)[0][:160],
+                    "evidence_ids": new_ids})
+                tool_log.append({"tool": asked["tool"], "query": asked.get("query", ""), "path": asked.get("path", "")})
+            replies += [tool_message(call, SKIPPED_CALL) for call in result.tool_calls[4:]]
+            messages = messages + [assistant_message(result), *replies]
+            used += int(sum(len(r["content"]) for r in replies) / CHARS_PER_TOKEN)
+            if used > limit or session.repeats >= 2:  # no room left for the analysis, or going round in circles
+                break
+            if any(kind_of(c) in ("edit", "write") for c in result.tool_calls):
+                break  # it has started on the change: it has seen enough (the call was answered "not yet")
+        new_items = [i for i in collector.items if i["id"] not in before]
+        if new_items:
+            await self.emit(state, "evidence", {"items": [self._ev_summary(i) for i in new_items]})
+        await self.phase(state, "evidence", label, "completed", f"{lookups} lookups, {len(new_items)} new snippets")
+        notes = (state.get("notes") or []) + collector.notes
+        if conclusion:
+            notes.append("From exploring the code: " + " ".join(conclusion.split())[:700])
+        return {"evidence": collector.items, "notes": notes, "tool_log": tool_log,
+                "tool_calls": state.get("tool_calls", 0) + lookups,
+                "evidence_rounds": state.get("evidence_rounds", 0) + 1, "evidence_done": True,
+                "explore_messages": messages, "conversation_tokens": used,
+                **self._usage(state, results)}
+
     async def plan_evidence(self, state: AgentState) -> dict:
+        if await self._tools_ok():
+            return await self._explore(state)
         rounds = state.get("evidence_rounds", 0)
         label = "Deciding what else to inspect" + (f" (round {rounds + 1})" if rounds else "")
         await self.phase(state, "evidence", label)
@@ -606,11 +818,23 @@ class LocPilotGraph:
                 seen.add(key)
                 summary, ids = collector.run_tool(req)
                 outcomes.append((req, summary, ids))
+            # Follow calls out of what was just read into the other files they lead to.
+            fresh = [i for i in collector.items if i["id"] not in before]
+            u = TaskUnderstanding.model_validate(state["understanding"]) if state.get("understanding") else None
+            callees = collector.add_callees(fresh, extract_terms(state["request"], u))
+            if callees:
+                outcomes.append((None, f"{len(callees)} called functions: "
+                                       + ", ".join(i["symbol"] or i["path"] for i in callees),
+                                 [i["id"] for i in callees]))
             return collector, outcomes
 
         collector, outcomes = await asyncio.to_thread(work)
         tool_log = list(state.get("tool_log") or [])
         for req, summary, ids in outcomes:
+            if req is None:  # functions the new evidence calls, followed automatically
+                await self.emit(state, "tool_call", {"tool": "find_definition", "args": {}, "summary": summary,
+                                                     "reason": "followed calls into other files", "evidence_ids": ids})
+                continue
             args = {k: v for k, v in {"query": req.query, "path": req.path, "start_line": req.start_line or None,
                                       "end_line": req.end_line or None}.items() if v}
             await self.emit(state, "tool_call", {"tool": req.tool, "args": args, "summary": summary,
@@ -641,11 +865,39 @@ class LocPilotGraph:
         if not state.get("evidence"):
             await self.log(state, "No relevant code was found for this request; the answer will say so.", "warning")
         template = prompts.ANALYZE_RCA if rca else prompts.ANALYZE_EXPLAIN
-        user = self._context(state) + "\n\n" + template.format(request=state["request"])
+        job = template.format(request=state["request"])
+        if rca:
+            job += prompts.pitfalls(i["path"] for i in state.get("evidence") or [])
         model_cls = LLMAnalysis if rca else LLMExplanation
-        raw, usage = await self.llm_json(state, "analyze", user, model_cls, max_tokens=2000)
+        results: list = []
+        # After exploring, the analysis continues that conversation (what the model read is all there); otherwise
+        # it gets the evidence in a prompt of its own.
+        messages = self._follow_up(state.get("explore_messages") or [], state.get("conversation_tokens", 0), job,
+                                   reserve=3000)
+        continued = messages is not None
+        raw = None
+        if continued:
+            try:
+                raw, usage = await self.llm_json(state, "analyze", "", model_cls, max_tokens=3000, messages=messages,
+                                                 keep=results, tools=EXPLORE_TOOLS)
+            except LLMResponseError as exc:  # not worth failing the task over: ask again the plain way
+                await self.log(state, f"The analysis could not continue the exploration ({str(exc)[:160]}); "
+                                      "starting it from the evidence instead.", "warning")
+                continued, results = False, []
+        if raw is None:
+            user = self._fit(lambda lines: self._context(state, evidence_lines=lines) + "\n\n" + job, reserve=3000)
+            messages = [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": user}]
+            raw, usage = await self.llm_json(state, "analyze", "", model_cls, max_tokens=3000, messages=messages,
+                                             keep=results)
         await self.phase(state, "analyze", label, "completed")
-        return {"raw_analysis": {"kind": "rca" if rca else "explanation", "data": raw.model_dump()}, **usage}
+        updates = {"raw_analysis": {"kind": "rca" if rca else "explanation", "data": raw.model_dump()},
+                   "explore_messages": [], "analysis_messages": [], **usage}
+        plan_next = state["mode"] == "code" and state["intent"] in ("fix", "retry_fix", "add_tests")
+        if plan_next and len(results) == 1 and await self._tools_ok():  # the plan continues from here
+            updates.update(analysis_messages=[*messages, {"role": "assistant", "content": results[0].content}],
+                           conversation_tokens=results[0].prompt_tokens + results[0].completion_tokens,
+                           conversation_tools=continued)
+        return updates
 
     async def validate(self, state: AgentState) -> dict:
         await self.phase(state, "validate", "Validating citations against the repository")
@@ -702,7 +954,17 @@ class LocPilotGraph:
         target = fix_files[0]
         stem = target.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         ext = target.rsplit(".", 1)[-1] if "." in target else "py"
-        tests = [near] if near else [f for f in index.files if is_test_path(f) and f.endswith("." + ext)]
+
+        def closeness(test: str) -> int:  # shared leading folders: tests of the same package come first
+            shared = 0
+            for a, b in zip(test.split("/")[:-1], target.split("/")[:-1], strict=False):
+                if a != b:
+                    break
+                shared += 1
+            return -shared
+
+        tests = [near] if near else sorted((f for f in index.files if is_test_path(f) and f.endswith("." + ext)),
+                                           key=closeness)
         if ext == "py":
             base = tests[0].rsplit("/", 1)[0] if tests and "/" in tests[0] else ("tests" if any(
                 f.startswith("tests/") for f in index.files) else "")
@@ -735,17 +997,29 @@ class LocPilotGraph:
         await self.phase(state, "plan", "Planning the change")
         report = state.get("report") or {}
         overview = state.get("overview") or {}
-        user = self._context(state) + "\n\n" + prompts.PLAN.format(
+        job = prompts.PLAN.format(
             problem=report.get("problem_summary", ""), root_cause=report.get("most_likely_root_cause") or "unknown",
             minimal_fix=report.get("minimal_fix", ""), request=state["request"],
             test_files=", ".join((overview.get("test_files") or [])[:12]) or "none",
             frameworks=", ".join(overview.get("test_frameworks") or []) or "unknown")
-        raw, usage = await self.llm_json(state, "plan", user, LLMPlan, max_tokens=800)
+        messages = self._follow_up(state.get("analysis_messages") or [], state.get("conversation_tokens", 0), job,
+                                   reserve=800)
+        raw = None
+        if messages is not None:
+            try:
+                raw, usage = await self.llm_json(state, "plan", "", LLMPlan, max_tokens=800, messages=messages,
+                                                 tools=EXPLORE_TOOLS if state.get("conversation_tools") else None)
+            except LLMResponseError:
+                pass  # ask again the plain way
+        if raw is None:
+            messages = [{"role": "system", "content": prompts.SYSTEM},
+                        {"role": "user", "content": self._context(state) + "\n\n" + job}]
+            raw, usage = await self.llm_json(state, "plan", "", LLMPlan, max_tokens=800, messages=messages)
         index = await asyncio.to_thread(self.index, state)
         warnings: list[str] = []
         files = []
         for f in raw.files_to_modify:
-            path = self._existing_path(index, f.path)
+            path = self._existing_path(index, f.path) or new_source_path(index, f.path)
             if path is None:
                 warnings.append(f"Plan referenced {f.path!r}, which does not exist; ignored.")
             elif is_test_path(path):
@@ -791,8 +1065,14 @@ class LocPilotGraph:
                     "warnings": (state.get("warnings") or []) + warnings}
         await self.phase(state, "plan", "Planning the change", "completed",
                          f"Change {', '.join(f['path'] for f in files)}; regression test in {test_file or 'n/a'}")
-        return {"plan": plan_out, "proposed_commands": commands, **usage,
-                "warnings": (state.get("warnings") or []) + warnings}
+        updates = {"plan": plan_out, "proposed_commands": commands, **usage, "analysis_messages": [],
+                   "warnings": (state.get("warnings") or []) + warnings}
+        # "Add X, with tests" is easily read as a request for tests. Tests alone are written for code that exists:
+        # when the plan creates the code, it is a change with tests.
+        if state["intent"] == "add_tests" and any(not index.has_file(f["path"]) for f in files):
+            await self.log(state, "The request needs new code, not only tests: writing the code first, then its tests.")
+            updates["intent"] = "fix"
+        return updates
 
     def route_after_plan(self, state: AgentState) -> str:
         return "finalize" if state.get("patch_error") else "generate_patch"
@@ -805,27 +1085,186 @@ class LocPilotGraph:
         more = f"\n… ({len(lines) - max_lines} more lines not shown)" if len(lines) > max_lines else ""
         return f"### {path}\n```{_lang_fence(path)}\n{redact(body)}\n```{more}"
 
-    async def _edit_loop(self, state: AgentState, step: str, prompt: str, *, workspace: Path, allowed: set[str],
-                         allowed_new: set[str], only_tests: bool = False, attempts: int = 2,
-                         protected: set[str] | None = None):
-        """Ask for SEARCH/REPLACE edits, validate them, and feed errors back (bounded)."""
-        if state.get("project_notes"):  # the owner's conventions matter most when writing code
-            prompt = prompts.project_notes_block(state["project_notes"]) + "\n\n" + prompt
-        messages = [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": prompt}]
-        usage = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
-        build = None
-        errors: list[str] = []
-        local_state = dict(state)
-        for attempt in range(attempts):
-            result = await self.llm_text(local_state, step, messages, max_tokens=1800)
+    async def _tool_edits(self, state: AgentState, local_state: dict, step: str, messages: list[dict],
+                          usage: dict, session: EditSession, walk: bool = False):
+        """The edit step as a tool loop: the model reads, edits, sees each result, and stops when it is done.
+
+        With ``walk`` the model is asked once, when it has finished, to walk the request's example through its
+        changed code with real values and to correct what that shows: a small model that declares a no-op fix
+        done finds the mistake as soon as it has to compute a result.
+        Returns the conversation and the model's last reply without tool calls (None if the turn limit ended it).
+        """
+        window = self._window()
+        previous, stuck, cut_off = "", 0, False
+
+        async def walk_through(convo: list[dict]) -> list[dict] | None:
+            """The conversation to go on with if the model's own walk-through shows its change is wrong."""
+            nonlocal walk
+            if not walk or not session.staged or local_state["llm_calls"] + 2 > self.settings.max_llm_calls:
+                return None
+            walk = False
+            asked = [*convo, {"role": "user", "content": prompts.WALK_THROUGH}]
+            kept: list = []
+            try:
+                # A JSON answer, so it reasons it out instead of reaching for a tool; the tools stay declared
+                # because this conversation was offered them (the model server reuses only an identical start).
+                checked, _totals = await self.llm_json(local_state, step, "", LLMWalkThrough, max_tokens=900,
+                                                       messages=asked, keep=kept, tools=EDIT_TOOLS)
+            except LLMResponseError:
+                return None
+            for k, v in (("llm_calls", len(kept)), ("prompt_tokens", sum(r.prompt_tokens for r in kept)),
+                         ("completion_tokens", sum(r.completion_tokens for r in kept))):
+                usage[k] += v
+            local_state["llm_calls"] = state.get("llm_calls", 0) + usage["llm_calls"]
+            if checked.correct or not kept:
+                return None
+            await self.log(state, "Walking the request's example through the change showed that it does not do what "
+                                  f"was asked (it returns: {' '.join(checked.result.split())[:160]}); correcting it.")
+            return [*asked, {"role": "assistant", "content": kept[-1].content},
+                    {"role": "user", "content": prompts.WALK_FAILED.format(result=checked.result.strip(),
+                                                                           expected=checked.expected.strip())}]
+        for _turn in range(MAX_EDIT_TURNS):
+            if local_state["llm_calls"] >= self.settings.max_llm_calls:
+                break
+            result = await self.llm_text(local_state, step, messages, max_tokens=EDIT_TURN_TOKENS, tools=EDIT_TOOLS)
             for k, v in (("llm_calls", 1), ("prompt_tokens", result.prompt_tokens),
                          ("completion_tokens", result.completion_tokens)):
                 usage[k] += v
             local_state["llm_calls"] = state.get("llm_calls", 0) + usage["llm_calls"]
-            blocks, problems = parse_edit_blocks(result.content)
+            session.tokens = result.prompt_tokens + result.completion_tokens
+            if not result.tool_calls and result.truncated and not cut_off:
+                # The reply ran into the length limit. Inside a tool call (a long new file, usually) the call is
+                # incomplete and the model server drops it: say so, or minutes of writing vanish without a trace.
+                # In prose the model was working something out at length — with edits made, it is done.
+                prose = len(result.content) > 1500
+                if prose and session.staged:
+                    return messages, None
+                cut_off = True
+                await self.log(state, "The model's reply ran to the length limit without an edit; asking again."
+                               if prose else "The model's edit was longer than one reply allows and was cut off; "
+                                             "asking for a shorter one.", "warning")
+                messages = messages + [{"role": "assistant", "content": result.content[:600] or "(cut off)"},
+                                       {"role": "user",
+                                        "content": prompts.CUT_OFF_PROSE if prose else prompts.CUT_OFF_CALL}]
+                continue
+            if not result.tool_calls:
+                checked = await walk_through([*messages, {"role": "assistant", "content": result.content or "DONE"}])
+                if checked is None:
+                    return messages, result
+                messages = checked
+                continue
+            # A model that keeps asking for something it cannot have (a shell, the same call again), or whose
+            # edits are all refused, is stuck: two such turns in a row end the loop with what is staged.
+            asked = json.dumps(result.tool_calls, sort_keys=True)
+            useful = asked != previous and any(kind_of(c) in ("read", "search", "edit", "write")
+                                               for c in result.tool_calls)
+            previous = asked
+            if not useful and stuck >= 1:
+                break
+            session.problems, session.new_reads = [], 0
+            session.can_read = result.prompt_tokens + result.completion_tokens < 0.72 * window
+            replies = []
+            staged_before = len(session.staged)
+            for call in result.tool_calls[:8]:
+                reply = await asyncio.to_thread(session.handle, call)
+                replies.append(tool_message(call, reply))
+                args = call.get("arguments") or {}
+                shown = {k: v for k, v in {"path": arg(args, *PATH_ARGS), "query": arg(args, "pattern", "query")}.items()
+                         if v}
+                tool = {"read": "read_file", "search": "search_text"}.get(kind_of(call), kind_of(call))
+                await self.emit(state, "tool_call", {"tool": tool, "args": shown,
+                                                     "summary": reply.split("\n", 1)[0][:200], "evidence_ids": []})
+            replies += [tool_message(call, SKIPPED_CALL) for call in result.tool_calls[8:]]
+            messages = messages + [assistant_message(result), *replies]
+            session.tokens += int(sum(len(r["content"]) for r in replies) / CHARS_PER_TOKEN)
+            kinds = {kind_of(c) for c in result.tool_calls}
+            staged_now = len(session.staged) > staged_before
+            refused = bool(session.problems) and not staged_now and kinds <= {"edit", "write"}
+            # With edits made, a turn that only looks again at code it has already seen is the model checking its
+            # work with nothing left to do: it rarely says DONE by itself, and each such turn costs time.
+            idle = bool(session.staged) and not staged_now and "read" in kinds and not session.new_reads
+            if staged_now or session.new_reads:
+                stuck = 0
+            elif refused or not useful or idle:
+                stuck += 1  # (a search alone neither counts nor clears the count)
+            if stuck >= 2:
+                checked = await walk_through(messages)
+                if checked is None:
+                    break
+                messages, stuck = checked, 0
+        return messages, None
+
+    async def _edit_loop(self, state: AgentState, step: str, prompt: str, *, workspace: Path, allowed: set[str],
+                         allowed_new: set[str], only_tests: bool = False, attempts: int = 2,
+                         protected: set[str] | None = None, tools: bool = False,
+                         base: list[dict] | None = None, convo: dict | None = None,
+                         seed: list[EditBlock] | None = None):
+        """Ask for edits, validate them, and feed errors back (bounded).
+
+        With ``tools`` the model first works through its edit tools (see agent/toolcalls.py). A model without
+        them — or one that answers in text anyway — uses SEARCH/REPLACE blocks, and JSON as the last resort.
+        ``base`` is a conversation this step continues and ``seed`` the edits already staged in it; ``convo``
+        receives the conversation afterwards ("messages", "tokens", "staged") so a later step can continue it.
+        """
+        if base:
+            messages = [*base, {"role": "user", "content": prompt}]
+        else:
+            if state.get("project_notes"):  # the owner's conventions matter most when writing code
+                prompt = prompts.project_notes_block(state["project_notes"]) + "\n\n" + prompt
+            messages = [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": prompt}]
+        usage = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+        build = None
+        errors: list[str] = []
+        local_state = dict(state)
+        local_state.setdefault("llm_calls", 0)
+        pending = None  # a text reply that ended the tool loop, read by the text protocol below
+        if tools:
+            session = EditSession(workspace, get_index(workspace), planned=allowed, allowed_new=allowed_new,
+                                  only_tests=only_tests, protected=protected, staged=seed,
+                                  tests_later=step == "fix_patch")
+            messages, pending = await self._tool_edits(state, local_state, step, messages, usage, session,
+                                                       walk=step == "fix_patch" and not base)
+            if session.staged:
+                if convo is not None:
+                    done = [{"role": "assistant", "content": pending.content}] if pending is not None else []
+                    convo.update(messages=[*messages, *done], tokens=session.tokens, staged=list(session.staged))
+                notes = [f"{path} was edited although the plan did not name it (the model found the change belonged "
+                         "there)." for path in session.unplanned]
+                return session.build(), usage, notes + session.problems
+            if pending is None:
+                return None, usage, session.problems or ["the model made no edits"]
+        as_json = False
+        for attempt in range(attempts):
+            if as_json:
+                # The last reply held no edits at all: often a sentence like "I'll make the edits" and nothing
+                # else. Constrained JSON can't stop there.
+                await self.log(state, "The model described the change instead of writing it; asking for the "
+                                      "edits as structured output.", "warning")
+                try:
+                    edit_list, json_usage = await self.llm_json(local_state, step, "", LLMEditList, max_tokens=2400,
+                                                                messages=messages)
+                except LLMResponseError as exc:
+                    return build, usage, [*errors, str(exc)[:300]]
+                for k in ("llm_calls", "prompt_tokens", "completion_tokens"):
+                    usage[k] += json_usage[k] - local_state.get(k, 0)
+                local_state.update(json_usage)
+                content = json.dumps(edit_list.model_dump())[:6000]
+                blocks = [EditBlock(e.path, e.search, e.replace) for e in edit_list.edits]
+                problems: list[str] = []
+            else:
+                if pending is not None:
+                    result, pending = pending, None
+                else:
+                    result = await self.llm_text(local_state, step, messages, max_tokens=1800)
+                    for k, v in (("llm_calls", 1), ("prompt_tokens", result.prompt_tokens),
+                                 ("completion_tokens", result.completion_tokens)):
+                        usage[k] += v
+                    local_state["llm_calls"] = state.get("llm_calls", 0) + usage["llm_calls"]
+                content = result.content
+                blocks, problems = parse_edit_blocks(result.content)
             if not blocks:
                 creatable = {a for a in allowed_new if not (workspace / a).exists()}
-                blocks = parse_fenced_new_files(result.content, creatable)
+                blocks = parse_fenced_new_files(content, creatable)
                 if blocks:
                     problems = []
             errors = list(problems)
@@ -849,6 +1288,7 @@ class LocPilotGraph:
                 kept.append(b)
             if not kept and not errors:
                 errors.append("no SEARCH/REPLACE blocks found in the reply")
+                as_json = not as_json  # next: the same edits as structured output
             if kept:
                 build = await asyncio.to_thread(build_patch, workspace, kept, allowed_new_files=allowed_new)
                 errors += build.errors
@@ -869,12 +1309,18 @@ class LocPilotGraph:
                 new_files = sorted(a for a in allowed_new if not (workspace / a).exists())
                 create_hint = "".join(f"\nTo create {p}, the block must be exactly:\n{p}\n<<<<<<< SEARCH\n=======\n"
                                       "<the whole file content>\n>>>>>>> REPLACE" for p in new_files[:2])
-                messages = messages + [
-                    {"role": "assistant", "content": result.content[:6000]},
-                    {"role": "user", "content": "Those edits could not be applied:\n- " + "\n- ".join(errors[:8]) +
-                                                "\nReply again with corrected SEARCH/REPLACE blocks only. Copy SEARCH "
-                                                "lines exactly from the file contents shown." + create_hint},
-                ]
+                if as_json and not kept:
+                    request = ("You described the change but did not write it. Give the edits now as JSON: "
+                               '{"edits": [{"path": ..., "search": ..., "replace": ...}]} — search: the exact existing '
+                               "lines (copied from the file contents shown, with indentation), replace: the new "
+                               "lines; an empty search creates the file or appends to it.")
+                else:
+                    as_json = False
+                    request = ("Those edits could not be applied:\n- " + "\n- ".join(errors[:8]) +
+                               "\nReply again with corrected SEARCH/REPLACE blocks only. Copy SEARCH lines exactly "
+                               "from the file contents shown." + create_hint)
+                messages = messages + [{"role": "assistant", "content": content[:6000] or "(no reply)"},
+                                       {"role": "user", "content": request}]
             else:
                 break
         return build, usage, errors
@@ -906,24 +1352,57 @@ class LocPilotGraph:
             plan_text += f"\n\nThe user rejected the previous patch with this feedback: {state['feedback']}"
 
         protected = self._protected_tests(state, index)
-        if repair and state.get("repair_target") == "test" and test_path:
+        tooled = await self._tools_ok()
+        work: dict = {}  # the conversation of this step's last edits, for a diagnosis to continue
+        diagnosed = state.get("diagnose_messages") or [] if tooled else []
+        if repair and state.get("repair_target") in ("test", "test_fix") and test_path:
             report = state.get("report") or {}
-            prompt = prompts.TEST_REPAIR.format(
-                request=state["request"], root_cause=report.get("most_likely_root_cause") or "",
-                fix_diff=self._current_diff(state), original_code=self._original_code(state, index),
-                test_file=self._file_block(index, test_path), test_path=test_path,
-                runs=self._runs_text((state.get("before_runs") or []) + (state.get("last_runs") or []))[:4000],
-                framework=self._framework_label(state, test_path),
-                rules=prompts.EDIT_RULES.format(example_path=test_path))
+            test_files = {test_path}
+            base = None
+            if state["repair_target"] == "test":  # it passed on the unfixed code: it does not reproduce the bug
+                step = "test_repair_patch"
+                prompt = prompts.TEST_REPAIR.format(
+                    request=state["request"], root_cause=report.get("most_likely_root_cause") or "",
+                    fix_diff=self._current_diff(state), original_code=self._original_code(state, index),
+                    test_file=self._file_block(index, test_path), test_path=test_path,
+                    runs=self._runs_text((state.get("before_runs") or []) + (state.get("last_runs") or []))[:4000],
+                    framework=self._framework_label(state, test_path),
+                    rules=prompts.edit_rules(test_path, tooled))
+            else:  # the tests are wrong, not the change: the new test's expectation, or outdated existing tests
+                step = "test_fix_patch"
+                diag = state.get("diagnosis") or {}
+                sources = [f for f in self._touched_files(state) if not is_test_path(f)] or fix_files
+                outdated = [p for p in state.get("repair_tests") or [] if index.has_file(p) and p != test_path]
+                prompt = prompts.TEST_FIX.format(
+                    request=state["request"], root_cause=report.get("most_likely_root_cause") or "",
+                    fix_diff="".join(c["diff"] for p in self._applied_patches(state) for c in p["changes"]
+                                     if c["kind"] != "test")[:5000] or "(no code change)",
+                    code_context=self._code_context(index, sources),
+                    test_file="\n\n".join(self._file_block(index, p) for p in [test_path, *outdated]),
+                    test_path=test_path, runs=self._runs_text(state.get("last_runs") or [])[:4000],
+                    diagnosis=f"{diag.get('diagnosis', '')}\nNext step: {diag.get('next_step', '')}",
+                    framework=self._framework_label(state, test_path),
+                    rules=prompts.edit_rules(test_path, tooled))
+                test_files |= set(outdated)
+                protected = protected - set(outdated)  # these may change: their assertions are outdated
+                follow_up = prompts.TEST_FIX_FOLLOW_UP.format(
+                    test_path=test_path, framework=self._framework_label(state, test_path),
+                    outdated="\n" + "\n\n".join(self._file_block(index, p) for p in outdated) if outdated else "none",
+                    rules=prompts.edit_rules(test_path, tooled))
+                if self._follow_up(diagnosed, state.get("diagnose_tokens", 0), follow_up, reserve=2400):
+                    base, prompt = diagnosed, follow_up  # the test run and its diagnosis are already there
             build, usage, errors = await self._edit_loop({**state, **self._merge_usage(state, usage_total)},
-                                                         "test_repair_patch", prompt, workspace=workspace,
-                                                         allowed={test_path}, allowed_new={test_path},
-                                                         only_tests=True, protected=protected)
+                                                         step, prompt, workspace=workspace,
+                                                         allowed=test_files, allowed_new={test_path},
+                                                         only_tests=True, protected=protected, tools=tooled,
+                                                         base=base, convo=work)
             add_usage(usage)
             if build is None or not build.changes:
                 return await self._patch_failed(state, usage_total, errors)
             changes = build.changes
             warnings += build.warnings + errors
+            warnings += [f"Updates the existing test {c.path}: the diagnosis is that the requested change makes its "
+                         "assertions outdated. Review this change carefully." for c in changes if c.path != test_path]
         elif repair:
             touched = self._touched_files(state)
             allowed = set(touched) | set(fix_files) | ({test_path} if test_path else set())
@@ -932,11 +1411,20 @@ class LocPilotGraph:
             prompt = prompts.REPAIR.format(runs=self._runs_text((state.get("user_runs") or [])
                                                                 + (state.get("last_runs") or state.get("runs") or [])),
                                            diagnosis=f"{diag.get('diagnosis', '')}\nNext step: {diag.get('next_step', '')}",
-                                           files=files_text, allowed=", ".join(sorted(allowed)),
-                                           rules=prompts.EDIT_RULES.format(example_path=sorted(allowed)[0]))
+                                           files=files_text, scope=prompts.edit_scope(sorted(allowed), tooled),
+                                           how="with the edit tools" if tooled else "with SEARCH/REPLACE edits",
+                                           rewrite=prompts.REWRITE if tooled else "",
+                                           rules=prompts.edit_rules(sorted(allowed)[0], tooled))
+            follow_up = prompts.REPAIR_FOLLOW_UP.format(scope=prompts.edit_scope(sorted(allowed), tooled),
+                                                        rewrite=prompts.REWRITE,
+                                                        rules=prompts.edit_rules(sorted(allowed)[0], tooled))
+            base = None
+            if self._follow_up(diagnosed, state.get("diagnose_tokens", 0), follow_up, reserve=2400):
+                base, prompt = diagnosed, follow_up  # the test run and its diagnosis are already there
             build, usage, errors = await self._edit_loop({**state, **self._merge_usage(state, usage_total)},
                                                          "repair_patch", prompt, workspace=workspace, allowed=allowed,
-                                                         allowed_new=set(), protected=protected)
+                                                         allowed_new=set(), protected=protected, tools=tooled,
+                                                         base=base, convo=work)
             add_usage(usage)
             if build is None or not build.changes:
                 return await self._patch_failed(state, usage_total, errors)
@@ -945,21 +1433,29 @@ class LocPilotGraph:
         else:
             tests_only = state.get("intent") == "add_tests"
             fix_diff = "(no code change in this step — the code under test is shown below)"
+            fix_changes: list[FileChange] = []
+            test_changes: list[FileChange] = []
+            fix_work: dict = {}
+            test_work: dict = {}
+            new_sources: set[str] = set()
             if not tests_only:
                 files_text = "\n\n".join(self._file_block(index, p) for p in fix_files)
                 report = state.get("report") or {}
                 prompt = prompts.EDIT_FIX.format(request=state["request"],
                                                  root_cause=report.get("most_likely_root_cause") or "(see plan)",
                                                  minimal_fix=report.get("minimal_fix") or plan.get("approach", ""),
-                                                 plan=plan_text, files=files_text, allowed=", ".join(fix_files),
-                                                 rules=prompts.EDIT_RULES.format(example_path=fix_files[0]))
+                                                 plan=plan_text, files=files_text,
+                                                 scope=prompts.edit_scope(fix_files, tooled),
+                                                 rules=prompts.edit_rules(fix_files[0], tooled))
+                new_sources = {p for p in fix_files if not index.has_file(p)}  # files the plan creates
                 build, usage, errors = await self._edit_loop({**state, **self._merge_usage(state, usage_total)},
                                                              "fix_patch", prompt, workspace=workspace,
-                                                             allowed=set(fix_files), allowed_new=set())
+                                                             allowed=set(fix_files), allowed_new=new_sources,
+                                                             tools=tooled, convo=fix_work)
                 add_usage(usage)
                 if build is None or not build.changes:
                     return await self._patch_failed(state, usage_total, errors)
-                changes = list(build.changes)
+                fix_changes = list(build.changes)
                 warnings += build.warnings + errors
                 fix_diff = build.diff[:5000]
             else:
@@ -972,16 +1468,23 @@ class LocPilotGraph:
                 code_context = self._code_context(index, fix_files)
                 report = state.get("report") or {}
                 framework = self._framework_label(state, test_path)
-                test_prompt = prompts.EDIT_TEST.format(
-                    request=state["request"], problem=report.get("problem_summary", ""),
-                    root_cause=report.get("most_likely_root_cause") or "",
-                    fix_diff=fix_diff, test_file_state="(existing — append a new test)" if exists else "(does not exist yet)",
-                    test_file=self._file_block(index, test_path) if exists else new_test_file(test_path),
-                    example_test=example or "(no existing tests found)", test_path=test_path,
-                    code_context=code_context, spec="{spec}",
-                    framework=framework, rules=prompts.EDIT_RULES.format(example_path=test_path))
+                shared = {"request": state["request"], "code_context": code_context, "test_path": test_path,
+                          "test_file_state": "(existing — append to it)" if exists else "(does not exist yet)",
+                          "test_file": self._file_block(index, test_path) if exists
+                          else new_test_file(test_path, tooled),
+                          "example_test": example or "(no existing tests found)", "framework": framework,
+                          "rules": prompts.edit_rules(test_path, tooled)}
+                if tests_only:  # tests for code that is taken to be correct: they must pass as it is
+                    test_prompt = prompts.ADD_TESTS.format(**shared)
+                else:
+                    test_prompt = prompts.EDIT_TEST.format(
+                        **{**shared, "test_file_state": "(existing — append a new test)" if exists
+                           else "(does not exist yet)"},
+                        problem=report.get("problem_summary", ""),
+                        root_cause=report.get("most_likely_root_cause") or "", fix_diff=fix_diff, spec="{spec}")
                 spec_text = "(no specification)"
-                if state.get("llm_calls", 0) + usage_total["llm_calls"] + 2 < self.settings.max_llm_calls:
+                if not tests_only and \
+                        state.get("llm_calls", 0) + usage_total["llm_calls"] + 2 < self.settings.max_llm_calls:
                     spec_user = prompts.TEST_SPEC.format(
                         request=state["request"], root_cause=report.get("most_likely_root_cause") or "",
                         minimal_fix=report.get("minimal_fix") or plan.get("approach", ""), code_context=code_context)
@@ -997,23 +1500,82 @@ class LocPilotGraph:
                     except LLMResponseError:
                         pass
                 test_prompt = test_prompt.replace("{spec}", spec_text)
+                if tooled:
+                    test_prompt += "\n" + prompts.TEST_TOOL_HINT
                 if state.get("llm_calls", 0) + usage_total["llm_calls"] < self.settings.max_llm_calls:
                     tbuild, tusage, terrors = await self._edit_loop(
                         {**state, **self._merge_usage(state, usage_total)}, "test_patch", test_prompt,
                         workspace=workspace, allowed={test_path}, allowed_new={test_path}, only_tests=True,
-                        protected=protected)
+                        protected=protected, tools=tooled, convo=test_work)
                     add_usage(tusage)
                     if tbuild is not None and tbuild.changes:
-                        changes += tbuild.changes
+                        test_changes = list(tbuild.changes)
                         warnings += tbuild.warnings + terrors
                     elif tests_only:
                         return await self._patch_failed(state, usage_total, terrors)
                     else:
                         warnings.append("Could not generate a valid regression test: " + "; ".join(terrors)[:400])
+
+            # A second look before the user sees it: does the change do what the request asks? A wrong fix and a
+            # test written from the same misunderstanding would otherwise "verify" each other.
+            if fix_changes and self.settings.check_changes and \
+                    state.get("llm_calls", 0) + usage_total["llm_calls"] + 2 < self.settings.max_llm_calls:
+                label_check = "Checking the change against your request"
+                await self.phase(state, "patch", label_check)
+                check = None
+                try:
+                    shown = "".join(c.diff for c in [*fix_changes, *test_changes])[:12000]
+                    check, check_usage = await self.llm_json(
+                        {**state, **self._merge_usage(state, usage_total)}, "check",
+                        prompts.CHECK_PATCH.format(request=state["request"], diff=shown), LLMPatchCheck, max_tokens=1300)
+                    add_usage({k: check_usage[k] - self._merge_usage(state, usage_total)[k] for k in usage_total})
+                except LLMResponseError:
+                    pass
+                failed = [r for r in check.requirements if not r.holds] if check else []
+                findings = "\n".join(f"- {r.requirement}: {r.why}" for r in failed) or \
+                    (f"- {check.correction.strip()}" if check and check.correction.strip() else "")
+                if check is None or check.verdict == "ok" or not findings:
+                    await self.phase(state, "patch", label_check, "completed", "Nothing found" if check else "Skipped")
+                else:
+                    await self.phase(state, "patch", label_check, "completed", f"Found: {findings[:300]}")
+                    revised = False
+
+                    async def revise(step: str, job: str, held: dict, **scope):
+                        """One more round in the conversation that made the edits, on top of them."""
+                        if not (tooled and held.get("messages")
+                                and self._follow_up(held["messages"], held.get("tokens", 0), job, reserve=2400)):
+                            return None
+                        rbuild, rusage, _errors = await self._edit_loop(
+                            {**state, **self._merge_usage(state, usage_total)}, step, job, workspace=workspace,
+                            tools=True, base=held["messages"], seed=held.get("staged"), convo=held, **scope)
+                        add_usage(rusage)
+                        return rbuild if rbuild is not None and rbuild.changes else None
+
+                    if check.verdict in ("code_wrong", "both_wrong"):
+                        rbuild = await revise("fix_patch", prompts.REVISE_FIX.format(findings=findings), fix_work,
+                                              allowed=set(fix_files), allowed_new=new_sources)
+                        if rbuild is not None and rbuild.diff != "".join(c.diff for c in fix_changes):
+                            fix_changes, fix_diff, revised = list(rbuild.changes), rbuild.diff[:5000], True
+                    # A test written for the first version of the fix is looked at again when the fix changed.
+                    if (check.verdict in ("test_wrong", "both_wrong") or revised) and test_changes and test_path:
+                        rbuild = await revise("test_patch",
+                                              prompts.REVISE_TEST.format(findings=findings, fix_diff=fix_diff),
+                                              test_work, allowed={test_path}, allowed_new={test_path},
+                                              only_tests=True, protected=protected)
+                        if rbuild is not None and rbuild.diff != "".join(c.diff for c in test_changes):
+                            test_changes, revised = list(rbuild.changes), True
+                    warnings.append(("LocPilot checked this change against your request, found a problem and revised "
+                                     "it. What the check found:\n" if revised else
+                                     "A check of this change against your request found a possible problem that was "
+                                     "not resolved:\n") + findings[:600])
+            changes = [*fix_changes, *test_changes]
+            work = test_work or fix_work  # the test-writing conversation has the code, the fix and the test
         diff = "".join(c.diff for c in changes)
         summary = plan.get("summary", "") if not repair else (state.get("diagnosis") or {}).get("next_step", "Repair")
         if repair and state.get("repair_target") == "test":
             summary = "Rewrite the regression test so it reproduces the bug"
+        elif repair and state.get("repair_target") == "test_fix":
+            summary = "Correct the regression test (it failed on the fixed code)"
         patch = self.db.add_patch(state["task_id"], turn=state["turn"], attempt=attempt_no, summary=summary[:500],
                                   diff=diff, changes=[c.to_dict() for c in changes], warnings=warnings)
         public = {k: v for k, v in patch.items() if k != "changes"}
@@ -1023,6 +1585,8 @@ class LocPilotGraph:
                                                                 for c in changes))
         merged = self._merge_usage(state, usage_total)
         return {"patch_id": patch["id"], "patch_attempts": attempt_no, "patch_error": None, **merged,
+                "work_messages": work.get("messages") or [], "work_tokens": work.get("tokens") or 0,
+                "diagnose_messages": [], "diagnose_tokens": 0,
                 "warnings": (state.get("warnings") or []) + warnings}
 
     @staticmethod
@@ -1266,7 +1830,8 @@ class LocPilotGraph:
                                             commands_approved=bool(state.get("approved_commands")),
                                             new_test_names=test_names)
         signature = failure_signature(last)
-        stalled = verification["verdict"] == "failed" and signature in (state.get("failure_signatures") or [])
+        stalled = verification["verdict"] in ("failed", "partial") and \
+            signature in (state.get("failure_signatures") or [])
         await self.emit(state, "log", {"level": "info" if verification["verdict"] == "passed" else "warning",
                                        "text": f"Verification verdict: {verification['verdict']} — "
                                                f"{verification['regression_test']['detail']}"})
@@ -1278,7 +1843,11 @@ class LocPilotGraph:
 
     def route_after_evaluate(self, state: AgentState) -> str:
         v = state.get("verification") or {}
-        if v.get("verdict") != "failed" and not state.get("test_repair_needed"):
+        # Tests that were failing before and still fail may be the very thing the user asked to fix ("the suite is
+        # red"): worth one look at whether they are, instead of filing them under "already broken".
+        red_suite = (v.get("verdict") == "partial" and v.get("still_failing") and state.get("intent") != "add_tests"
+                     and (state.get("diagnosis") or {}).get("cause") != "preexisting_failure")
+        if v.get("verdict") != "failed" and not state.get("test_repair_needed") and not red_suite:
             return "finalize"
         if state.get("stalled"):
             return "finalize"
@@ -1327,10 +1896,41 @@ class LocPilotGraph:
                     "feedback": None}
         await self.phase(state, "diagnose", "Inspecting the failure")
         runs = self._observed_runs(state)
-        user = self._context(state, evidence_lines=30, with_user_runs=False) + "\n\n" + prompts.DIAGNOSE.format(
-            runs=self._runs_text(runs) + (f"\n\nUser message: {state['request']}" if state.get("intent") == "retry_fix" else ""),
-            diff=self._current_diff(state))
-        fa, usage = await self.llm_json(state, "diagnose", user, LLMFailureAnalysis, max_tokens=600)
+        # When the failures can be attributed — LocPilot's own new test, or existing tests that were passing — the
+        # question is which side is wrong, and the user's request decides. (Asked openly, a small model tends to
+        # "restore" a correct fix, or to rewrite working code, to satisfy its own wrong test.)
+        v = state.get("verification") or {}
+        new_failing, existing_failing = v.get("new_test_failures") or [], v.get("existing_failures") or []
+        still_failing = v.get("still_failing") or []
+        attributed = bool(new_failing or existing_failing or still_failing)
+        runs_text = self._runs_text(runs) + (f"\n\nUser message: {state['request']}"
+                                             if state.get("intent") == "retry_fix" else "")
+        if attributed:
+            job = prompts.DIAGNOSE_TESTS.format(
+                runs=runs_text, diff=self._current_diff(state), request=state["request"],
+                new_failing="; ".join(new_failing[:6]) or "passes",
+                existing_failing="; ".join(existing_failing[:8]) or "all pass",
+                still_failing="; ".join(still_failing[:8]) or "none")
+        else:
+            job = prompts.DIAGNOSE.format(runs=runs_text, diff=self._current_diff(state))
+        job += prompts.pitfalls([*self._touched_files(state), *(i["path"] for i in state.get("evidence") or [])])
+        # With the failing tests named, the model traces the failing assertion with real values before it judges:
+        # asked for a verdict straight away it defends the theory its change was built on.
+        answer, budget = (LLMTracedFailure, 1200) if attributed else (LLMFailureAnalysis, 600)
+        # Where the model wrote the test (or the fix) it can see its own work and the code: diagnose there.
+        results: list = []
+        fa = None
+        messages = self._follow_up(state.get("work_messages") or [], state.get("work_tokens", 0), job, reserve=600) \
+            if attributed and await self._tools_ok() else None
+        if messages is not None:
+            try:
+                fa, usage = await self.llm_json(state, "diagnose", "", answer, max_tokens=budget,
+                                                messages=messages, keep=results, tools=EDIT_TOOLS)
+            except LLMResponseError:
+                results = []  # ask again the plain way
+        if fa is None:
+            user = self._context(state, evidence_lines=30, with_user_runs=False) + "\n\n" + job
+            fa, usage = await self.llm_json(state, "diagnose", user, answer, max_tokens=budget)
         env_cause = environment_problem(runs)
         diag = fa.model_dump()
         if env_cause:
@@ -1342,7 +1942,16 @@ class LocPilotGraph:
         detail = f"{diag['cause'].replace('_', ' ')}: {diag['diagnosis'][:300]}"
         await self.phase(state, "diagnose", "Inspecting the failure", "completed",
                          detail + ("" if retry else " — not retrying"))
-        updates = {"diagnosis": diag, "retry_planned": retry, "repair_target": "code", **usage}
+        target, outdated = "code", []
+        if attributed and diag["cause"] == "test_incorrect":  # the tests change, the code stays
+            target = "test_fix"
+            index = await asyncio.to_thread(get_index, Path(state["worktree_path"] or state["workspace_path"]))
+            outdated = test_files_in(existing_failing, index.files)
+        updates = {"diagnosis": diag, "retry_planned": retry, "repair_target": target, "repair_tests": outdated,
+                   "diagnose_messages": [], "diagnose_tokens": 0, **usage}
+        if len(results) == 1 and messages is not None:  # the repair continues from here
+            updates.update(diagnose_messages=[*messages, {"role": "assistant", "content": results[0].content}],
+                           diagnose_tokens=results[0].prompt_tokens + results[0].completion_tokens)
         if retry:
             updates.update(repair_attempts=state.get("repair_attempts", 0) + 1, patch_mode="repair", feedback=None)
         else:
@@ -1456,6 +2065,11 @@ def compute_verification(before: list[dict], after: list[dict], new_test_paths: 
     new_failures = [t for t in failing_after if t not in failing_before]
     result["preexisting_failures"] = preexisting
     result["new_failures"] = new_failures
+    # Existing tests that were failing (the suite was already red) and pass with the change.
+    fixed_existing = [t for t in preexisting if t not in failing_after]
+    failed_before = sum(((r["summary"] or {}).get("failed") or 0) for r in before) - (1 if new_in_before else 0)
+    result["fixed_tests"] = fixed_existing
+    result["still_failing"] = [t for t in preexisting if t in failing_after]
 
     reg = result["regression_test"]
     if new_test_paths:
@@ -1470,6 +2084,13 @@ def compute_verification(before: list[dict], after: list[dict], new_test_paths: 
         elif before_outcomes and all(o == "passed" for o in before_outcomes):
             reg.update(status="did_not_fail_before_fix",
                        detail="The new test already passed on the unfixed code, so it does not reproduce the bug.")
+        elif fixed_existing and verdict == "passed":
+            # The project's own tests prove the change, whatever LocPilot's new test does.
+            reg.update(status="fixed_failing_tests",
+                       detail=f"{failed_before or len(fixed_existing)} existing test(s) that failed before the change "
+                              f"pass after it ({', '.join(fixed_existing[:3])}) — confirmed by execution."
+                              + ("" if new_in_before else " LocPilot's own new test did not fail before the change, "
+                                                          "so it adds no proof."))
         elif any(o in ("failed", "error") for o in before_outcomes) and not failing_before and verdict == "passed":
             reg.update(status="detected_bug",
                        detail="Tests failed before the fix and pass after it (per-test names were not available; "
@@ -1481,6 +2102,14 @@ def compute_verification(before: list[dict], after: list[dict], new_test_paths: 
     if verdict == "failed" and failing_after and all(t in preexisting for t in failing_after):
         verdict = "partial"
     result["verdict"] = verdict
+    # Whose failures these are (runners name a test with or without its file): the test LocPilot just wrote, or
+    # tests of the project that were passing — failures that existed before the change are neither.
+    mine = [t for t in failing_after if new_test_paths and (
+        _test_matches(t, new_test_paths, new_test_names)
+        or any(len(n) >= 8 and n in t for n in new_test_names or []))]
+    result["new_test_failures"] = mine
+    result["existing_failures"] = [t for t in failing_after if t not in mine and t not in preexisting]
+    result["only_new_test_fails"] = bool(mine) and len(mine) == len(failing_after)
     return result
 
 
@@ -1560,7 +2189,13 @@ def build_final_report(state: AgentState, db: Database) -> dict:
                      if r["stage"] != "before_fix")
         reg_status = verification["regression_test"]["status"]
         passed_note = f" ({n_pass} tests passed)" if n_pass else ""
-        if verdict == "passed" and (reg_status == "detected_bug" or intent == "add_tests"):
+        if verdict == "passed" and reg_status == "fixed_failing_tests" and intent != "add_tests":
+            status = "changes_verified"
+            headline = ("Verified by execution: tests of this project that failed before the change pass after "
+                        f"it{passed_note}.")
+            next_steps.append("Review the diff in the Changes panel, then download the .patch and apply it to your "
+                              "branch (git apply) — LocPilot never commits or pushes.")
+        elif verdict == "passed" and (reg_status == "detected_bug" or intent == "add_tests"):
             status = "changes_verified"
             headline = ("Verified by execution: LocPilot's regression test failed before the change and passes after "
                         f"it{passed_note}. Review the test — it encodes LocPilot's reading of the expected behavior."

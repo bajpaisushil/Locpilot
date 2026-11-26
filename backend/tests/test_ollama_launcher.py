@@ -42,6 +42,8 @@ loaded = [m for m in os.environ.get("FAKE_OLLAMA_LOADED", "").split(",") if m]  
 models = json.loads(os.environ.get("FAKE_OLLAMA_MODELS") or "null") or [
     {"name": n, "size": 4_700_000_000} for n in ("mimo-v2.6:9b-q4_K_M", "llama3.2:3b")]
 think_forever = os.environ.get("FAKE_OLLAMA_THINK_FOREVER") == "1"  # thinking never ends within the budget
+# Like MiMo: told not to think it reasons anyway, Ollama drops that, and the reply is empty.
+silent_without_thinking = os.environ.get("FAKE_OLLAMA_SILENT_WITHOUT_THINKING") == "1"
 # Reasoning a thinking model streams (one token per piece) before it answers "ok", as far as num_predict allows.
 reasoning = json.loads(os.environ.get("FAKE_OLLAMA_REASONING") or "null")
 lock = threading.Lock()
@@ -89,6 +91,9 @@ class Handler(BaseHTTPRequestHandler):
             elif body.get("model") not in loaded:
                 loaded.append(body["model"])  # a chat (or load) request puts the model in memory
         if self.path == "/api/chat":
+            if body.get("think") is False and silent_without_thinking:
+                self.reply([{"done": True, "prompt_eval_count": 3, "eval_count": 52, "done_reason": "stop"}], ndjson=True)
+                return
             if body.get("think") is True and think_forever:
                 self.reply([{"message": {"content": "", "thinking": "hmm "}, "done": False},
                             {"done": True, "prompt_eval_count": 3, "eval_count": 9, "done_reason": "length"}],

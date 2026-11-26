@@ -14,7 +14,7 @@ from typing import Any
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from locpilot.agent.graph import AgentDeps, BudgetExceeded, build_graph, turn_input
+from locpilot.agent.graph import CONTEXT_KEYS, AgentDeps, BudgetExceeded, build_graph, turn_input
 from locpilot.agent.workspace import (
     USER_STAGE,
     WorkspaceError,
@@ -129,7 +129,31 @@ class TaskManager:
         if turn <= 1:
             return {}
         snapshot = await self.graph.aget_state(self.thread_config(task_id, turn - 1))
-        return dict(snapshot.values or {})
+        carry = dict(snapshot.values or {})
+        task = self.db.get_task(task_id)
+        if task and (task["stats"] or {}).get("context_cleared_turn") == turn - 1:
+            for key in CONTEXT_KEYS:  # the user cleared the context after the last turn
+                carry.pop(key, None)
+        return carry
+
+    async def clear_context(self, task_id: str) -> None:
+        """Start the next message fresh: forget what earlier turns found and said (the code and changes stay).
+
+        Long conversations fill the model's context window with old evidence and answers, which leaves less room
+        for the code that matters now and makes every step slower.
+        """
+        async with self._locks[task_id]:
+            task = self.db.get_task(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if self.is_running(task_id) or task["status"] in ("queued", "running", "awaiting_approval"):
+                raise TaskConflictError("Wait for the current turn to finish (or cancel it) before clearing the context.")
+            stats = task["stats"] or {}
+            stats.update(context_cleared_turn=task["turn"], context_tokens=0)
+            self.db.update_task(task_id, stats=stats)
+            await self.emit(task_id, task["turn"], "log", {
+                "level": "info", "text": "Context cleared: your next message starts fresh. The worktree and the "
+                                         "changes LocPilot made are kept."})
 
     async def start_turn(self, task_id: str, message: str, mode: str) -> None:
         async with self._locks[task_id]:

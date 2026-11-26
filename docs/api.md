@@ -176,6 +176,7 @@ bitbucket.org) or `git@github.com:<owner>/<repo>.git`. URLs containing credentia
 | DELETE | `/api/tasks/{task_id}` | Deletes task history and removes LocPilot's worktree for it → `{ ok: true }` |
 | POST | `/api/tasks/{task_id}/messages` | body `{ message, mode?: "ask" | "code" }` follow-up turn → `TaskDetail`. 409 if a turn is running. |
 | POST | `/api/tasks/{task_id}/cancel` | → `TaskDetail` |
+| POST | `/api/tasks/{task_id}/context/clear` | The next message starts fresh: earlier turns' findings, evidence and answers are left out of the model's context; the worktree and applied changes stay → `TaskDetail` (409 `task_busy` while a turn runs or waits for approval) |
 | POST | `/api/tasks/{task_id}/resume` | Resume an `interrupted` task from its last checkpoint → `TaskDetail` |
 | POST | `/api/tasks/{task_id}/approvals/{approval_id}` | body `ApprovalDecision` → `TaskDetail` |
 | GET | `/api/tasks/{task_id}/events?after=<event_id>` | **SSE** stream (see §4) |
@@ -234,6 +235,8 @@ interface TaskDetail extends TaskSummary { repo: RepoSummary; workspace_path: st
   messages: MessageOut[]; reports: FinalReport[];  // one per completed turn, oldest first
   patches: PatchOut[]; commands: CommandOut[];      // commands without stdout/stderr
   pending_approval: ApprovalOut | null; stats: Record<string, number> }
+  // stats includes context_tokens (prompt size of the last model call), context_window (num_ctx) and,
+  // after Clear context, context_cleared_turn
 interface DiffFile { path: string; change: "modify" | "create" | "delete"; original: string | null;
   modified: string | null; unified: string; binary: boolean }
 interface TaskDiff { base_commit: string | null; worktree_path: string | null; files: DiffFile[]; unified: string }

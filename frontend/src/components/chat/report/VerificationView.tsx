@@ -34,6 +34,10 @@ const VERDICT = {
 
 const REGRESSION = {
   detected_bug: { label: 'Regression test failed before the fix and passes after it', variant: 'success' as const },
+  fixed_failing_tests: {
+    label: 'Tests of this project that failed before the fix pass after it',
+    variant: 'success' as const,
+  },
   did_not_fail_before_fix: {
     label: 'Regression test did not fail before the fix — it may not detect the bug',
     variant: 'warning' as const,

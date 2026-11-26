@@ -47,6 +47,13 @@ cloud model fallback.
   **Commit & Push** to a `locpilot/…` branch (your checked-out branch is never moved; push uses
   your own Git credentials and then links to the pull-request page), or **Apply to my repo**
   to drop the changes into your own folder as uncommitted edits.
+* **Works the way the model was trained** — models that can call tools (the default MiMo, Qwen3-Coder, …)
+  investigate with `read`, `grep` and `find_definition`, seeing each result before the next step, and change code
+  by calling `edit` and `write`; LocPilot stages and validates those edits and nothing is written before you
+  approve. Models without tool calling print SEARCH/REPLACE blocks instead. Either way, a change is checked
+  against your request before you see it (and revised if a requirement does not hold); when only LocPilot's own
+  new test fails, it works out whether the test or the fix is wrong; and it updates an existing test only after
+  that test has been seen failing because your request changed what it asserts — and tells you so.
 * **Repository intelligence** — `.gitignore`-aware inventory with secret/dependency/build
   exclusions, literal and regex search, Tree-sitter (JS/TS/Go/Java/Rust) and `ast` (Python)
   symbols, callers/callees and static call chains, imports, manifests and test-runner
@@ -55,8 +62,9 @@ cloud model fallback.
   folders not to touch); LocPilot gives it to the model in every step (about 1,500 characters at most,
   secrets redacted).
 * **Made for 16 GB machines** — an Ollama that LocPilot starts stores the context in 8 bits (about half
-  the memory); Settings shows the RAM the model uses next to what is free, warns before it would make
-  your computer swap, and has **Free RAM now**. The code index lives on disk (`index/symbols.sqlite`),
+  the memory); a memory meter in the top bar shows the RAM the model uses next to what is free, warns
+  before it would make your computer swap, and has **Free RAM now**; for a task it shows how full the
+  context window is, with **Clear context** to start the next message fresh. The code index lives on disk (`index/symbols.sqlite`),
   so big repositories cost disk, not RAM, and nothing is parsed twice. **Settings → Storage** frees
   disk space: archive finished tasks' worktrees (restored automatically when used again) and clean up
   old agent states, caches and logs.

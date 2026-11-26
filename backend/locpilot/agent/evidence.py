@@ -45,6 +45,7 @@ class QueryTerms:
     words: list[str] = field(default_factory=list)
     quoted: list[str] = field(default_factory=list)
     paths: list[str] = field(default_factory=list)
+    vocabulary: set[str] = field(default_factory=set)  # every (stemmed) word, not capped like `words`
 
     def all_terms(self) -> list[str]:
         return list(dict.fromkeys([*self.identifiers, *self.words]))
@@ -92,6 +93,7 @@ def extract_terms(request: str, understanding: TaskUnderstanding | None) -> Quer
             continue
         stemmed.append(_stem(w))
     terms.words = list(dict.fromkeys(stemmed))[:16]
+    terms.vocabulary = set(stemmed) | {_stem(p) for i in terms.identifiers for p in split_identifier(i)}
     terms.quoted = list(dict.fromkeys(terms.quoted))[:6]
     terms.paths = list(dict.fromkeys(terms.paths))[:8]
     return terms
@@ -125,28 +127,95 @@ class EvidenceCollector:
         return None
 
     def add(self, path: str, start: int, end: int, *, kind: str, title: str, reason: str,
-            symbol: str | None = None) -> dict | None:
+            symbol: str | None = None, over_budget: float = 1.0, exact: bool = False) -> dict | None:
+        """Add lines of a file as one evidence item (None: no such lines, or the budget is used up).
+
+        ``exact`` adds these very lines whatever is known already: a read the model asked for, where the caller
+        has worked out which lines are new.
+        """
         lines = self.index.read_lines(path)
         if not lines:
             return None
         start = max(1, start)
         end = min(len(lines), max(start, end))
-        if end - start + 1 > MAX_ITEM_LINES:
-            end = start + MAX_ITEM_LINES - 1
-        existing = self._overlaps(path, start, end)
+        cap = MAX_READ_LINES if exact else MAX_ITEM_LINES
+        if end - start + 1 > cap:
+            end = start + cap - 1
+        existing = None if exact else self._overlaps(path, start, end)
         if existing is not None:
-            return existing
+            # Mostly seen already, but a read that reaches past what is in the evidence must still show the rest:
+            # asking for lines 120-260 when 76-185 are known has to add 186-260, not silently return 76-185.
+            unseen = self._uncovered(path, start, end)
+            if unseen is None:
+                return existing
+            start, end = unseen
+            title = f"{path}:{start}-{end}"
         content = redact(number_lines(lines, start, end))
-        if self.used_chars + len(content) > self.max_chars:
+        if self.used_chars + len(content) > self.max_chars * over_budget:
             return None
         item = {"id": self._next_id(), "path": path, "start_line": start, "end_line": end, "kind": kind,
                 "title": title[:160], "reason": reason[:200], "symbol": symbol, "content": content}
         self.items.append(item)
         return item
 
-    def add_symbol(self, sym: Symbol, *, kind: str = "definition", reason: str) -> dict | None:
+    def _uncovered(self, path: str, start: int, end: int, min_lines: int = 8) -> tuple[int, int] | None:
+        """The longest run of lines in start..end that no evidence item of ``path`` shows yet (if long enough)."""
+        covered: set[int] = set()
+        for item in self.items:
+            if item["path"] == path:
+                covered.update(range(item["start_line"], item["end_line"] + 1))
+        best: tuple[int, int] | None = None
+        run_start: int | None = None
+        for line in range(start, end + 2):
+            if line <= end and line not in covered:
+                run_start = line if run_start is None else run_start
+            elif run_start is not None:
+                if best is None or line - run_start > best[1] - best[0] + 1:
+                    best = (run_start, line - 1)
+                run_start = None
+        return best if best and best[1] - best[0] + 1 >= min_lines else None
+
+    def add_callees(self, items: list[dict], terms: QueryTerms, limit: int = 3) -> list[dict]:
+        """Definitions, in other files, of functions the given code calls when their names relate to the request.
+
+        A bug often sits one call away from where the symptom shows: the follower's vote handler in one module
+        calls `candidateIsUpToDate` from another, and the model can only fix what it sees.
+        """
+        vocab = terms.vocabulary or {_stem(w) for w in terms.words}
+        scored: dict[tuple[str, int], tuple[int, Symbol]] = {}
+        for item in items:
+            if item.get("kind") in ("test", "callee") or is_test_path(item["path"]):
+                continue
+            region = Symbol(name=item.get("symbol") or "", kind="range", path=item["path"],
+                            start_line=item["start_line"], end_line=item["end_line"])
+            for name, _line, defs in self.symbols.callees(region, limit=80):
+                shared = vocab & {_stem(part) for part in split_identifier(name)}
+                # Two words in common, or one distinctive one ("candidate", not "log"): related, not a coincidence.
+                if not (len(shared) >= 2 or any(len(w) >= 6 for w in shared)):
+                    continue
+                overlap = len(shared)
+                for sym in defs:
+                    if sym.path == item["path"] or is_test_path(sym.path) or sym.end_line - sym.start_line > 60:
+                        continue
+                    key = (sym.path, sym.start_line)
+                    if key not in scored or scored[key][0] < overlap:
+                        scored[key] = (overlap, sym)
+        added: list[dict] = []
+        for _overlap, sym in sorted(scored.values(), key=lambda pair: (-pair[0], pair[1].path, pair[1].start_line)):
+            if len(added) >= limit:
+                break
+            before = len(self.items)
+            # Short and often where the bug is: allowed slightly past the evidence budget.
+            item = self.add_symbol(sym, kind="callee", reason=f"`{sym.name}` is called by code in the evidence",
+                                   over_budget=1.15)
+            if item is not None and len(self.items) > before:
+                added.append(item)
+        return added
+
+    def add_symbol(self, sym: Symbol, *, kind: str = "definition", reason: str, over_budget: float = 1.0) -> dict | None:
         return self.add(sym.path, sym.start_line, sym.end_line, kind=kind,
-                        title=f"{sym.kind} {sym.qualname}", reason=reason, symbol=sym.qualname)
+                        title=f"{sym.kind} {sym.qualname}", reason=reason, symbol=sym.qualname,
+                        over_budget=over_budget)
 
     def add_window(self, path: str, line: int, *, radius: int, kind: str, title: str, reason: str) -> dict | None:
         enclosing = self.symbols.enclosing(path, line)
@@ -210,7 +279,10 @@ class EvidenceCollector:
                 self.add(path, start, end, kind="search_hit", title=f"{path}:{start}-{end}",
                          reason="matches the request's keywords")
 
-        # 5. Related tests for the main code
+        # 5. Functions that code calls in other files, when their names relate to the request
+        self.add_callees(list(self.items), terms)
+
+        # 6. Related tests for the main code
         targets = [s.name for s in primary[:2]] or [i["symbol"].rsplit(".", 1)[-1] for i in self.items
                                                      if i.get("symbol")][:2]
         for name in targets:

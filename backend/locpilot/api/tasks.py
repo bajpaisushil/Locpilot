@@ -144,6 +144,17 @@ async def cancel_task(task_id: str, request: Request) -> dict:
     return task_detail(request, task_id)
 
 
+@router.post("/{task_id}/context/clear")
+async def clear_task_context(task_id: str, request: Request) -> dict:
+    """The next message starts fresh: earlier turns' findings leave the model's context (code and changes stay)."""
+    _task_or_404(request, task_id)
+    try:
+        await manager_of(request).clear_context(task_id)
+    except TaskConflictError as exc:
+        raise ApiError(409, "task_busy", str(exc)) from None
+    return task_detail(request, task_id)
+
+
 @router.post("/{task_id}/resume")
 async def resume_task(task_id: str, request: Request) -> dict:
     _task_or_404(request, task_id)

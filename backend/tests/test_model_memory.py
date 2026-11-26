@@ -217,6 +217,41 @@ MIMO_INFO = {"general.architecture": "qwen35", "qwen35.block_count": 32, "qwen35
              "qwen35.full_attention_interval": 4, "qwen35.attention.recurrent_layers": [True, True, True, False] * 8}
 
 
+def test_models_with_cheap_context_get_a_larger_window_by_default(settings, monkeypatch):
+    from locpilot.app import default_llm_factory
+    from locpilot.llm import ollama as ollama_mod
+    from locpilot.llm.ollama import context_for
+    from locpilot.storage.db import Database
+
+    url = "http://127.0.0.1:11434"
+    gib = 2**30
+    monkeypatch.setattr(ollama_mod, "_show_cache", {
+        (url, "mimo"): {"model_info": {**MIMO_INFO, "qwen35.context_length": 262144}},
+        (url, "llama"): {"model_info": {**LLAMA_8B_INFO, "llama.context_length": 131072}},
+        (url, "short"): {"model_info": {**MIMO_INFO, "qwen35.context_length": 8192}},
+    })
+    assert context_for(url, "mimo", 16384, 16 * gib) == 32768  # 32k costs it about 1 GB
+    assert context_for(url, "llama", 16384, 16 * gib) == 16384  # 32k would cost an 8B Llama over 4 GB
+    assert context_for(url, "mimo", 16384, 8 * gib) == 16384  # not on a small machine
+    assert context_for(url, "short", 16384, 16 * gib) == 16384  # the model was not trained for 32k
+    assert context_for(url, "unknown", 16384, 16 * gib) == 16384  # Ollama has not described it (yet)
+
+    monkeypatch.setattr("locpilot.app.physical_memory", lambda: 16 * gib)
+    db = Database(settings.db_path)
+    try:
+        auto = default_llm_factory(settings.model_copy(update={"model": "mimo"}), db)()
+        assert (auto.num_ctx, auto.num_ctx_auto) == (32768, True)
+        from locpilot.config import Settings
+
+        env = Settings(data_dir=settings.data_dir, model="mimo", num_ctx=16384)  # LOCPILOT_NUM_CTX is a choice
+        assert default_llm_factory(env, db)().num_ctx == 16384
+        db.set_setting("num_ctx", 8192)  # and so is the value saved in Settings
+        chosen = default_llm_factory(settings.model_copy(update={"model": "mimo"}), db)()
+        assert (chosen.num_ctx, chosen.num_ctx_auto) == (8192, False)
+    finally:
+        db.close()
+
+
 def test_hybrid_models_only_cache_their_attention_layers():
     from locpilot.llm.ollama import kv_cache_bytes
 

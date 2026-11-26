@@ -61,7 +61,7 @@ def settings(tmp_path: Path) -> Settings:
     return s
 
 
-Responder = str | dict | Callable[[list[dict]], str | dict]
+Responder = str | dict | LLMResult | Callable[[list[dict]], "str | dict | LLMResult"]
 
 
 class FakeLLM:
@@ -76,10 +76,18 @@ class FakeLLM:
         "fix": "Implement the fix described in the plan",
         "test": "Write ONE focused regression test",
         "diagnose": "Diagnose why verification failed",
-        "repair": "Fix the problem with SEARCH/REPLACE edits",
+        "repair": "Fix the problem with",
         "review": "only claim test results that appear above",
         "test_repair": "so it does NOT reproduce the bug",
         "test_spec": "Design ONE regression test before writing any code",
+        "test_fix": "Correct the tests, not the code",
+        "add_tests": "Write the tests the request asks for",
+        "check": "Check this change against the request",
+        "walk": "Before this change goes on, check it the way a reviewer would",
+        "rework": "Your own walk-through shows that the change does not do what the request asks",
+        "revise_fix": "Before your change is shown to the user it was checked",
+        "revise_test": "Before your test is shown to the user it was checked",
+        "explore": "Investigate with the tools until the evidence shows",
     }
 
     def __init__(self, script: dict[str, Responder | list[Responder]], model: str = "fake-model") -> None:
@@ -89,19 +97,24 @@ class FakeLLM:
         self.gate: asyncio.Event | None = None
         self.block_step: str | None = None
         self.thinks: dict[str, list[bool]] = {}  # step -> the think flag of each call
+        self.conversations: list[tuple[str, list[dict], list[dict] | None]] = []  # (step, messages, tools) per call
 
     def _step(self, messages: list[dict]) -> str:
-        text = messages[1]["content"] if len(messages) > 1 else messages[-1]["content"]
-        for step, marker in self.STEPS.items():
-            if marker in text:
-                return step
-        raise AssertionError(f"FakeLLM: unknown prompt: {text[-300:]}")
+        # The latest user message that names a step (a follow-up in a conversation, or the first prompt).
+        for message in reversed(messages):
+            if message["role"] != "user":
+                continue
+            for step, marker in self.STEPS.items():
+                if marker in message["content"]:
+                    return step
+        raise AssertionError(f"FakeLLM: unknown prompt: {messages[-1]['content'][-300:]}")
 
     async def chat(self, messages, *, schema=None, max_tokens=1024, on_progress=None, temperature=None,
-                   think=False) -> LLMResult:
+                   think=False, tools=None) -> LLMResult:
         step = self._step(messages)
         self.calls.append(step)
         self.thinks.setdefault(step, []).append(think)
+        self.conversations.append((step, messages, tools))
         if self.block_step == step and self.gate is not None:
             await self.gate.wait()
         if on_progress is not None:
@@ -113,6 +126,8 @@ class FakeLLM:
         if responder is None:
             raise AssertionError(f"FakeLLM: no script for step {step}")
         value = responder(messages) if callable(responder) else responder
+        if isinstance(value, LLMResult):  # e.g. a reply made of tool calls
+            return value
         content = value if isinstance(value, str) else json.dumps(value)
         return LLMResult(content=content, prompt_tokens=100, completion_tokens=50, duration_ms=5, model=self.model)
 
@@ -210,6 +225,10 @@ class CrossSupplierDuplicatesTest(unittest.TestCase):
                    "side_effects": ["none known"], "risks": []},
         "diagnose": {"diagnosis": "The fix is incomplete.", "cause": "fix_incorrect", "should_retry": True,
                      "next_step": "Hoist the dict"},
+        "walk": {"example": "H1 DBL BB from a (120) and b (110)", "trace": "best ends as {H1/DBL/BB: 110}",
+                 "result": "one offer at 110", "expected": "one offer at 110", "correct": True, "problem": ""},
+        "check": {"requirements": [{"requirement": "the same room appears once", "holds": True, "why": "one dict"}],
+                  "verdict": "ok", "correction": ""},
         "repair": fix,
     }
     script.update(overrides)

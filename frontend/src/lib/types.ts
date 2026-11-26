@@ -76,6 +76,8 @@ export interface ModelStatus {
   model_available: boolean
   models: ModelInfo[]
   num_ctx: number
+  /** LocPilot chose this context size (the model stores context cheaply); a saved value replaces it. */
+  num_ctx_auto?: boolean
   temperature: number
   error: string | null
   hint: string | null
@@ -521,7 +523,7 @@ export interface Verification {
   verdict: 'passed' | 'failed' | 'not_run' | 'partial'
   runs: VerificationRun[]
   regression_test: {
-    status: 'detected_bug' | 'did_not_fail_before_fix' | 'not_created' | 'unknown'
+    status: 'detected_bug' | 'fixed_failing_tests' | 'did_not_fail_before_fix' | 'not_created' | 'unknown'
     detail: string
   }
   preexisting_failures: string[]

@@ -77,6 +77,11 @@ function ModelForm({ status }: { status: ModelStatus }) {
             value={numCtx}
             onChange={(e) => setNumCtx(e.target.value)}
           />
+          {status.num_ctx_auto && Number(numCtx) === status.num_ctx && (
+            <p className="text-[11px] text-muted-foreground" data-testid="num-ctx-auto">
+              Chosen automatically: this model stores context cheaply, so the larger window costs little memory.
+            </p>
+          )}
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="temperature">Temperature</Label>

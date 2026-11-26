@@ -286,7 +286,7 @@ async def main() -> None:
     parser.add_argument("--model", default=None)
     parser.add_argument("--thinking", choices=["auto", "on", "off"], default=None,
                         help="when a thinking model reasons first (default: the LOCPILOT_THINKING setting)")
-    parser.add_argument("--max-minutes", type=float, default=15)
+    parser.add_argument("--max-minutes", type=float, default=25)  # room for one verify-diagnose-repair round
     parser.add_argument("--output", default=str(ROOT / "docs" / "benchmark-results.md"))
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()

@@ -91,7 +91,15 @@ class Settings(BaseSettings):
     sandbox_allow_localhost: bool = False
 
     max_retries: int = 2
-    max_llm_calls: int = 24
+    # Model calls per turn. A step in which the model works with tools (reading, then editing) is several short
+    # calls, so this is higher than the number of steps.
+    max_llm_calls: int = 60
+    # Offer tool-capable models real tools (read, grep, edit, write) instead of asking them to print edits as
+    # text. Agent-tuned models answer with tool calls by training; turn off for a model whose tool calls misbehave.
+    native_tools: bool = True
+    # Before a change is proposed, the model checks it against the request (does every requirement really hold, with
+    # concrete numbers?) and revises it if not: catches a wrong fix that its own wrong test would "verify".
+    check_changes: bool = True
     max_evidence_rounds: int = 2
     max_patch_attempts: int = 2
     max_evidence_chars: int = 26_000

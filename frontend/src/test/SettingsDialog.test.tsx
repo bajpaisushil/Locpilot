@@ -35,6 +35,16 @@ describe('SettingsDialog model section', () => {
     renderWithProviders(<SettingsDialog />)
     expect(await screen.findByText('ready')).toBeInTheDocument()
     expect(screen.queryByTestId('model-switched-note')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('num-ctx-auto')).not.toBeInTheDocument()
+  })
+
+  it('says when the context window was chosen automatically', async () => {
+    mockFetch({
+      'GET /api/model/status': modelStatus({ configured_model: mimo.name, models: [mimo], num_ctx: 32768, num_ctx_auto: true }),
+    })
+    renderWithProviders(<SettingsDialog />)
+    expect(await screen.findByTestId('num-ctx-auto')).toHaveTextContent('Chosen automatically')
+    expect(screen.getByLabelText('Context window (tokens)')).toHaveValue(32768)
   })
 })
 

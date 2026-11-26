@@ -191,6 +191,46 @@ async def test_reasoning_that_never_ends_still_gets_an_answer(tmp_path):
         ollama.stop()
 
 
+async def test_an_empty_answer_without_thinking_is_asked_again_with_thinking(tmp_path):
+    # Seen with MiMo on edit prompts: 52 tokens generated, nothing returned, and the step failed with "no edits".
+    ollama = RunningOllama(tmp_path, models=[MIMO], FAKE_OLLAMA_SILENT_WITHOUT_THINKING="1")
+    try:
+        result = await client_for(ollama, MIMO["name"]).chat([{"role": "user", "content": "hi"}], max_tokens=300)
+        assert result.content == "ok" and result.thinking == "let me see"
+        assert result.completion_tokens == 52 + 1  # both calls count
+        assert [(r["think"], r["num_predict"]) for r in ollama.requests("/api/chat")] == [(False, 300), (True, 4396)]
+    finally:
+        ollama.stop()
+
+
+async def test_structured_output_cut_off_is_retried_with_a_larger_budget():
+    from pydantic import BaseModel
+
+    from locpilot.llm.ollama import LLMResult, chat_json
+
+    class Answer(BaseModel):
+        text: str
+
+    class Verbose:
+        model = "verbose"
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, messages, *, schema=None, max_tokens=1024, on_progress=None, temperature=None,
+                       think=False):
+            self.budgets.append(max_tokens)
+            if max_tokens < 4000:  # the answer needs more than the first budget
+                return LLMResult(content='{"text": "a long analys', prompt_tokens=1, completion_tokens=max_tokens,
+                                 duration_ms=1, model=self.model, truncated=True)
+            return LLMResult(content='{"text": "done"}', prompt_tokens=1, completion_tokens=5, duration_ms=1,
+                             model=self.model)
+
+    client = Verbose()
+    answer, results = await chat_json(client, [{"role": "user", "content": "analyze"}], Answer, max_tokens=3000)
+    assert answer.text == "done" and client.budgets == [3000, 4096] and len(results) == 2
+
+
 def steps(n: int) -> list[str]:
     return [f"step {i}, " for i in range(n)]  # reasoning that keeps moving on
 
