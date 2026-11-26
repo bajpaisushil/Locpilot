@@ -34,7 +34,9 @@ jobs:
       matrix:
         include:
           - name: macOS (Apple Silicon)
-            os: macos-14
+            # GitHub's current Apple Silicon image. A pinned older label (macos-14) stopped being served: the
+            # job was cancelled before a runner was assigned, and the release had no Apple Silicon installer.
+            os: macos-latest
             target: aarch64-apple-darwin
           - name: macOS (Intel)
             # GitHub's x86_64 macOS runner label. If GitHub retires it, switch to the
